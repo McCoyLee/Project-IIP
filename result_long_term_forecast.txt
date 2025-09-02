@@ -1,0 +1,96 @@
+forecast_ETTh1_full_shot_timer_xl_UnivariateDatasetBenchmark_sl2880_it96_ot96_lr5e-06_bt32_wd0_el8_dm1024_dff2048_nh8_cosTrue_test_0  
+mse:0.39383676648139954, mae:0.40815120935440063
+
+forecast_ETTh1_full_shot_timer_xl_UnivariateDatasetBenchmark_sl2880_it96_ot96_lr5e-06_bt32_wd0_el8_dm1024_dff2048_nh8_cosTrue_test_0  
+mse:0.23432867228984833, mae:0.21707764267921448
+
+forecast_ETTh1_full_shot_timer_xl_MultivariateDatasetBenchmark_sl2880_it96_ot96_lr5e-06_bt32_wd0_el8_dm1024_dff2048_nh8_cosTrue_test_0  
+mse:0.08438032865524292, mae:0.20522059500217438
+
+./test  
+mse:0.2922705113887787, mae:0.3940027952194214
+
+./test  
+mse:0.08438032865524292, mae:0.20522059500217438
+
+forecast_GEFcom12_Z1_MS_pred24_timer_xl_MultivariateDatasetBenchmark_sl720_it24_ot24_lr5e-06_bt32_wd0_el8_dm1024_dff2048_nh8_cosFalse_test_0  
+mse:nan, mae:nan
+
+forecast_GEFcom12_Z1_MS_pred24_timer_xl_MultivariateDatasetBenchmark_sl720_it24_ot24_lr5e-06_bt32_wd0_el8_dm1024_dff2048_nh8_cosFalse_test_0  
+mse:0.35274606943130493, mae:0.21032153069972992
+
+forecast_Plant1_MS_pred96_timer_xl_MultivariateDatasetBenchmark_sl1440_it96_ot96_lr5e-06_bt16_wd0_el8_dm1024_dff2048_nh8_cosFalse_test_0  
+mse:nan, mae:nan
+
+forecast_Plant1_MS_pred96_timer_xl_MultivariateDatasetBenchmark_sl1440_it96_ot96_lr5e-06_bt16_wd0_el8_dm1024_dff2048_nh8_cosFalse_test_0  
+mse:0.2274446189403534, mae:0.37892305850982666
+
+./test  
+mse:0.2274446189403534, mae:0.37892305850982666
+
+./test  
+mse:nan, mae:nan
+
+./test  
+mse:nan, mae:nan
+
+long_term_forecast_ettm1_timerxl_train_timer_xl_ETTm1_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.5137863159179688, mae:0.4443207085132599
+
+long_term_forecast_ettm1_timerxl_train_timer_xl_ETTm1_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.35684436559677124, mae:0.37300604581832886
+
+long_term_forecast_ettm1_timerxl_moe_train_e8_timer_xl_ETTm1_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.3521530032157898, mae:0.3707231879234314
+
+.  
+mse:0.03462781384587288, mae:0.13927437365055084
+
+.  
+mse:0.03301936760544777, mae:0.13536012172698975
+
+long_term_forecast_ettm1_timerxl_unica_timer_xl_ETTm1_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.32755669951438904, mae:0.34925395250320435
+
+.  
+mse:0.03163882717490196, mae:0.13395075500011444
+
+long_term_forecast_ettm1_timerxl_unica_revin_timer_xl_ETTm1_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.32575106620788574, mae:0.3503202795982361
+
+/home/limaocheng/OpenLTM/results/ettm1_timerxl_unica_revin/long_term_forecast_ettm1_timerxl_unica_revin_timer_xl_ETTm1_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.032572612166404724, mae:0.13565894961357117
+
+long_term_forecast_weather_timerxl_unica_revin_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.4896157681941986, mae:0.48116934299468994
+
+long_term_forecast_weather_timerxl_moe_e8_timer_xl_Weather_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.4450113773345947, mae:0.46865561604499817
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_unica_revin/long_term_forecast_weather_timerxl_unica_revin_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.1910688281059265, mae:0.3248404860496521
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_moe_e8/long_term_forecast_weather_timerxl_moe_e8_timer_xl_Weather_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.18006795644760132, mae:0.31574422121047974
+
+long_term_forecast_weather_timerxl_unica_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.46059951186180115, mae:0.46498122811317444
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_unica/long_term_forecast_weather_timerxl_unica_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.16662967205047607, mae:0.30351096391677856
+
+long_term_forecast_weather_timerxl_base_timer_xl_Weather_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.4739082157611847, mae:0.47524699568748474
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_base/long_term_forecast_weather_timerxl_base_timer_xl_Weather_sl672_it24_ot24_lr0.0001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.7035961747169495, mae:0.6329647302627563
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_unica_revin/long_term_forecast_weather_timerxl_unica_revin_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.1910688281059265, mae:0.3248404860496521
+
+long_term_forecast_weather_timerxl_base_fix_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.4677608013153076, mae:0.4752570688724518
+
+/home/limaocheng/OpenLTM/results/weather_timerxl_base_fix/long_term_forecast_weather_timerxl_base_fix_timer_xl_Weather_sl672_it24_ot24_lr0.001_bt32_wd0_el3_dm256_dff1024_nh8_cosFalse_test_0  
+mse:0.16355137526988983, mae:0.30301618576049805
+

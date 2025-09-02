@@ -85,7 +85,6 @@ class Exp_Forecast(Exp_Basic):
                     outputs = outputs[:, :, :]
                     batch_y = batch_y[:, :, :].to(self.device)
 
-                # 原有 covariate 逻辑（可选，仅在 args.covariate=True 时启用）
                 if self.args.covariate:
                     if self.args.last_token:
                         outputs = outputs[:, -self.args.output_token_len:, -1]
@@ -93,8 +92,7 @@ class Exp_Forecast(Exp_Basic):
                     else:
                         outputs = outputs[:, :, -1]
                         batch_y = batch_y[:, :, -1]
-
-                loss = criterion(outputs, batch_y)
+                loss = criterion(outputs[..., :1], batch_y[..., :1])
 
                 loss = loss.detach().cpu()
                 total_loss.append(loss)
@@ -159,8 +157,6 @@ class Exp_Forecast(Exp_Basic):
                     torch.cuda.synchronize()
                 if self.args.nonautoregressive:
                     batch_y = batch_y[:, -self.args.output_token_len:, :]
-
-                # 原有 covariate 逻辑（可选）
                 if self.args.covariate:
                     if self.args.last_token:
                         outputs = outputs[:, -self.args.output_token_len:, -1]
@@ -168,8 +164,7 @@ class Exp_Forecast(Exp_Basic):
                     else:
                         outputs = outputs[:, :, -1]
                         batch_y = batch_y[:, :, -1]
-
-                loss = criterion(outputs, batch_y)
+                loss = criterion(outputs[..., :1], batch_y[..., :1])
                 if (i + 1) % 100 == 0:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
                         print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -244,7 +239,6 @@ class Exp_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
                 
-                # 推理步数：按 output_token_len 逐段滚动到 test_pred_len
                 inference_steps = self.args.test_pred_len // self.args.output_token_len
                 dis = self.args.test_pred_len - inference_steps * self.args.output_token_len
                 if dis != 0:
@@ -252,7 +246,6 @@ class Exp_Forecast(Exp_Basic):
                 pred_y = []
                 for j in range(inference_steps):  
                     if len(pred_y) != 0:
-                        # 把上一步预测拼接到输入末尾，继续滚动预测
                         batch_x = torch.cat([batch_x[:, self.args.input_token_len:, :], pred_y[-1]], dim=1)
                     outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
                     pred_y.append(outputs[:, -self.args.output_token_len:, :])
@@ -268,21 +261,6 @@ class Exp_Forecast(Exp_Basic):
 
                 preds.append(pred)
                 trues.append(true)
-
-                # 可视化（若开启），通道选择与评测保持一致
-                if self.args.visualize and i % 2 == 0:
-                    dir_path = folder_path + f'{self.args.test_pred_len}/'
-                    if not os.path.exists(dir_path):
-                        os.makedirs(dir_path)
-                    # 选择可视化通道：若只评目标通道，则按 target_channel；否则默认最后一列
-                    c = int(getattr(self.args, 'target_channel', -1)) if getattr(self.args, 'eval_target_only', False) else -1
-                    C = pred.shape[-1]
-                    if c < 0 or c >= C:
-                        c = C - 1
-                    gt = np.array(true[0, :, c])
-                    pd = np.array(pred[0, :, c])
-                    visual(gt, pd, os.path.join(dir_path, f'{i}.pdf'))
-
                 if (i + 1) % 100 == 0:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
                         speed = (time.time() - time_now) / iter_count
@@ -290,32 +268,23 @@ class Exp_Forecast(Exp_Basic):
                         print("\titers: {}, speed: {:.4f}s/iter, left time: {:.4f}s".format(i + 1, speed, left_time))
                         iter_count = 0
                         time_now = time.time()
+                if self.args.visualize and i % 2 == 0:
+                    dir_path = folder_path + f'{self.args.test_pred_len}/'
+                    if not os.path.exists(dir_path):
+                        os.makedirs(dir_path)
+                    gt = np.array(true[0, :, -1])
+                    pd = np.array(pred[0, :, -1])
+                    visual(gt, pd, os.path.join(dir_path, f'{i}.pdf'))
 
-        preds = torch.cat(preds, dim=0).numpy()   # [N, H, C]
-        trues = torch.cat(trues, dim=0).numpy()   # [N, H, C]
+        preds = torch.cat(preds, dim=0).numpy()
+        trues = torch.cat(trues, dim=0).numpy()
         print('preds shape:', preds.shape)
         print('trues shape:', trues.shape)
-
-        # ============ 只评目标通道（例如 OT） ============
-        # 需要在命令行传：--eval_target_only --target_channel 6
-        if getattr(self.args, 'eval_target_only', False):
-            c = int(getattr(self.args, 'target_channel', -1))
-            C = preds.shape[-1]
-            if c < 0 or c >= C:
-                c = C - 1
-            preds = preds[..., c:c+1]
-            trues = trues[..., c:c+1]
-            print(f"[Eval] only target channel idx={c}; preds={preds.shape}, trues={trues.shape}")
-        # ==============================================
-
-        # 原有 covariate 逻辑（若启用，则再取最后一列）
         if self.args.covariate:
             preds = preds[:, :, -1]
             trues = trues[:, :, -1]
-
         mae, mse, rmse, mape, mspe, smape = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
-
         f = open("result_long_term_forecast.txt", 'a')
         f.write(setting + "  \n")
         f.write('mse:{}, mae:{}'.format(mse, mae))
@@ -323,4 +292,3 @@ class Exp_Forecast(Exp_Basic):
         f.write('\n')
         f.close()
         return
-

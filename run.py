@@ -9,6 +9,34 @@ from exp.exp_forecast import Exp_Forecast
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Timer-XL')
 
+    # ---- eval options (新增) ----
+    parser.add_argument('--eval_target_only', action='store_true',
+                    help='only evaluate the target channel (e.g., OT)')
+    parser.add_argument('--target_channel', type=int, default=6,
+                    help='0-based index of target channel; ETTm1 OT=6')
+
+    #RevIN
+    parser.add_argument('--revin', action='store_true', default=False)
+    parser.add_argument('--revin_affine', action='store_true', default=True)
+    parser.add_argument('--revin_eps', type=float, default=1e-5)
+
+
+    #UniCA
+    parser.add_argument('--use_unica', action='store_true',
+                    help='enable UniCA-style covariate homogenization + fusion', default=False)
+    parser.add_argument('--unica_bottleneck', type=int, default=128,
+                    help='bottleneck dim of covariate adapter')
+    parser.add_argument('--unica_fusion', type=str, default='film_gate',
+                    choices=['film_gate', 'res_add'],
+                    help='fusion mode: film_gate or res_add')
+    parser.add_argument('--unica_exclude_target', action='store_true', default=False,
+                    help='exclude target channel statistics when building covariate features')
+
+    # MoE
+    parser.add_argument('--use_moe', action='store_true')
+    parser.add_argument('--num_experts', type=int, default=8)
+    parser.add_argument('--moe_init_noise', type=float, default=0.0)
+
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='forecast', help='task name, options:[forecast]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
@@ -114,7 +142,7 @@ if __name__ == '__main__':
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
     elif args.ddp:
-        ip = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        ip = os.environ.get("MASTER_ADDR", "128.0.0.1")
         port = os.environ.get("MASTER_PORT", "64209")
         hosts = int(os.environ.get("WORLD_SIZE", "8"))
         rank = int(os.environ.get("RANK", "0")) 
@@ -130,11 +158,14 @@ if __name__ == '__main__':
         Exp = Exp_Forecast
     else:
         Exp = Exp_Forecast
-
+    
     if args.is_training:
         for ii in range(args.itr):
             # setting record of experiments
             exp = Exp(args)  # set experiments
+            if getattr(args, 'use_moe', False) and hasattr(exp, 'model') \
+            and hasattr(exp.model, 'convert_dense_ffn_to_moe'):
+                exp.model.convert_dense_ffn_to_moe()
             setting = '{}_{}_{}_{}_sl{}_it{}_ot{}_lr{}_bt{}_wd{}_el{}_dm{}_dff{}_nh{}_cos{}_{}_{}'.format(
                 args.task_name,
                 args.model_id,
@@ -178,5 +209,8 @@ if __name__ == '__main__':
             args.cosine,
             args.des, ii)
         exp = Exp(args)  # set experiments
+        if getattr(args, 'use_moe', False) and hasattr(exp, 'model') \
+        and hasattr(exp.model, 'convert_dense_ffn_to_moe'):
+            exp.model.convert_dense_ffn_to_moe()
         exp.test(setting, test=1)
         torch.cuda.empty_cache()

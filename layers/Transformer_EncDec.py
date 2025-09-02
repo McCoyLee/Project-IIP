@@ -1,5 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
+import torch
+from layers.moe_ffn import MoEFeedForward  # 新增
 
 
 class EncoderLayer(nn.Module):
@@ -99,7 +101,7 @@ class DecoderOnlyLayer(nn.Module):
 
 
 class TimerLayer(nn.Module):
-    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu"):
+    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu", use_moe: bool = False, num_experts: int = 8, moe_init_noise: float = 0.0):
         super(TimerLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
@@ -112,6 +114,40 @@ class TimerLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
+        # === MoE 配置 ===
+        self.use_moe_flag = use_moe
+        self.moe_init_noise = moe_init_noise
+        self._is_moe_enabled = False
+        if self.use_moe_flag:
+            self._moe = MoEFeedForward(d_model=d_model, d_ff=d_ff,
+                                       num_experts=num_experts,
+                                       dropout=dropout, activation=activation)
+        else:
+            self._moe = None
+
+    @torch.no_grad()
+    def enable_moe(self):
+        """
+        在 load_state_dict() 之后调用：
+        1) 将 conv1/conv2 的权重复制到所有专家（expert0 完全等价，其余可加微扰）；
+        2) 标记本层启用 MoE。
+        """
+        if self._moe is None or self._is_moe_enabled:
+            return
+        self._moe.init_from_conv1x1(self.conv1, self.conv2, noise_std=self.moe_init_noise)
+        self._is_moe_enabled = True
+
+    def _dense_ffn(self, y: torch.Tensor) -> torch.Tensor:
+        # 完全复现你原来的 1x1 Conv FFN 路径
+        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
+        y = self.dropout(self.conv2(y).transpose(-1, 1))
+        return y  # [B, L, D]
+
+    def _moe_ffn(self, y: torch.Tensor) -> torch.Tensor:
+        # MoE FFN 路径（与 _dense_ffn I/O 一致）
+        # 若你需要负载均衡正则，可传 return_aux_loss=self.training
+        return self._moe(y)  # or: self._moe(y, return_aux_loss=self.training)
+
     def forward(self, x, n_vars, n_tokens, attn_mask=None, tau=None, delta=None):
         new_x, attn = self.attention(
             x, x, x,
@@ -122,9 +158,11 @@ class TimerLayer(nn.Module):
         )
         x = x + self.dropout(new_x)
 
-        y = x = self.norm1(x)
-        y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
-        y = self.dropout(self.conv2(y).transpose(-1, 1))
+        y = self.norm1(x)
+        if getattr(self, "_is_moe_enabled", False):
+            y = self._moe_ffn(y)       # 走 MoE（需要你在加载完权重后调用 enable_moe()）
+        else:
+            y = self._dense_ffn(y)
 
         return self.norm2(x + y), attn
 
