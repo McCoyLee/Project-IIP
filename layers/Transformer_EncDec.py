@@ -101,7 +101,12 @@ class DecoderOnlyLayer(nn.Module):
 
 
 class TimerLayer(nn.Module):
-    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu", use_moe: bool = False, num_experts: int = 8, moe_init_noise: float = 0.0):
+    #def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu", use_moe: bool = False, num_experts: int = 8, moe_init_noise: float = 0.0):
+    def __init__(self, attention, d_model, d_ff=None, dropout=0.1, activation="relu", use_moe: bool = False, num_experts: int = 8, moe_init_noise: float = 0.0,
+                 moe_topk: int = 1, moe_capacity_factor: float = 1.25,
+                 moe_gate_temp: float = 1.0, moe_gate_noise_std: float = 0.0,
+                 moe_lb_alpha: float = 0.0, moe_imp_alpha: float = 0.0,
+                 moe_zloss_beta: float = 0.0, moe_entropy_reg: float = 0.0):
         super(TimerLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
@@ -119,11 +124,18 @@ class TimerLayer(nn.Module):
         self.moe_init_noise = moe_init_noise
         self._is_moe_enabled = False
         if self.use_moe_flag:
-            self._moe = MoEFeedForward(d_model=d_model, d_ff=d_ff,
-                                       num_experts=num_experts,
-                                       dropout=dropout, activation=activation)
+            #self._moe = MoEFeedForward(d_model=d_model, d_ff=d_ff, num_experts=num_experts, dropout=dropout, activation=activation)
+            self._moe = MoEFeedForward(
+                d_model=d_model, d_ff=d_ff, num_experts=num_experts,
+                dropout=dropout, activation=activation,
+                top_k=moe_topk, capacity_factor=moe_capacity_factor,
+                gate_temp=moe_gate_temp, gate_noise_std=moe_gate_noise_std,
+                lb_alpha=moe_lb_alpha, imp_alpha=moe_imp_alpha,
+                zloss_beta=moe_zloss_beta, entropy_reg=moe_entropy_reg,
+            )
         else:
             self._moe = None
+        self.register_buffer("_moe_aux_total", torch.tensor(0.0))
 
     @torch.no_grad()
     def enable_moe(self):
@@ -141,12 +153,20 @@ class TimerLayer(nn.Module):
         # 完全复现你原来的 1x1 Conv FFN 路径
         y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
         y = self.dropout(self.conv2(y).transpose(-1, 1))
+        self._moe_aux_total.zero_()
         return y  # [B, L, D]
 
     def _moe_ffn(self, y: torch.Tensor) -> torch.Tensor:
         # MoE FFN 路径（与 _dense_ffn I/O 一致）
         # 若你需要负载均衡正则，可传 return_aux_loss=self.training
-        return self._moe(y)  # or: self._moe(y, return_aux_loss=self.training)
+        #return self._moe(y)  # or: self._moe(y, return_aux_loss=self.training)
+        y = self._moe(y)
+        aux = self._moe._last_aux["total"]
+        if isinstance(aux, torch.Tensor):
+            self._moe_aux_total.copy_(aux.detach())
+        else:
+            self._moe_aux_total.copy_(torch.tensor(float(aux), device=self._moe_aux_total.device))
+        return y
 
     def forward(self, x, n_vars, n_tokens, attn_mask=None, tau=None, delta=None):
         new_x, attn = self.attention(

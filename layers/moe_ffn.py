@@ -1,128 +1,173 @@
 # layers/moe_ffn.py
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 
-def get_activation(name: str):
-    name = name.lower()
-    if name == "relu":
-        return F.relu
-    if name == "gelu":
-        return F.gelu
-    raise ValueError(f"Unknown activation: {name}")
-
-
-class _ExpertFFN(nn.Module):
-    """
-    单个专家：两层前馈（等价于原先的 1x1 Conv FFN，但用 Linear 实现，便于逐 token 路由）
-    输入/输出形状: [..., D] -> [..., D]
-    """
-    def __init__(self, d_model: int, d_ff: int, dropout: float, activation: str):
+class ExpertFFN(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1, activation="relu"):
         super().__init__()
-        self.fc1 = nn.Linear(d_model, d_ff)
-        self.fc2 = nn.Linear(d_ff, d_model)
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.act = get_activation(activation)
+        self.act = F.relu if activation == "relu" else F.gelu
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N_tokens, D]
-        x = self.dropout(self.act(self.fc1(x)))
-        x = self.dropout(self.fc2(x))
-        return x
+    def forward(self, x):
+        return self.w2(self.dropout(self.act(self.w1(x))))
 
 
 class MoEFeedForward(nn.Module):
     """
-    轻量级 MoE 前馈（Top-1 Router，Switch-Transformer 风格，**无**容量限制）
-    - Router: Linear(d_model -> num_experts), softmax 后 argmax 选专家
-    - Experts: num_experts 个 ExpertFFN
-    - 形状：输入 [B, L, D]，输出 [B, L, D]
-    - 兼容 TimerLayer.enable_moe() 的 init_from_conv1x1(...)
+    Switch-style MoE FFN with top-k routing, capacity factor, load-balance/importance loss,
+    z-loss on router logits, temperature & noise in gating.
     """
+
     def __init__(
-        self,
-        d_model: int,
-        d_ff: int,
-        num_experts: int = 8,
-        dropout: float = 0.1,
-        activation: str = "gelu",
+            self,
+            d_model: int,
+            d_ff: int,
+            num_experts: int = 8,
+            dropout: float = 0.1,
+            activation: str = "relu",
+            # router & regularization
+            top_k: int = 1,
+            capacity_factor: float = 1.25,
+            gate_temp: float = 1.0,
+            gate_noise_std: float = 0.0,
+            lb_alpha: float = 0.0,
+            imp_alpha: float = 0.0,
+            zloss_beta: float = 0.0,
+            entropy_reg: float = 0.0,
     ):
         super().__init__()
-        assert num_experts >= 1
-        self.d_model = d_model
-        self.d_ff = d_ff
+        assert top_k in (1, 2)
         self.num_experts = num_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.gate_temp = gate_temp
+        self.gate_noise_std = gate_noise_std
+        self.lb_alpha = lb_alpha
+        self.imp_alpha = imp_alpha
+        self.zloss_beta = zloss_beta
+        self.entropy_reg = entropy_reg
 
-        # router 初始化成近似均匀（避免一开始就偏置某个专家）
-        self.router = nn.Linear(d_model, num_experts)
-        nn.init.zeros_(self.router.weight)
-        nn.init.zeros_(self.router.bias)
+        self.experts = nn.ModuleList(
+            [ExpertFFN(d_model, d_ff, dropout, activation) for _ in range(num_experts)]
+        )
+        self.gate = nn.Linear(d_model, num_experts)
 
-        self.experts = nn.ModuleList([
-            _ExpertFFN(d_model, d_ff, dropout, activation) for _ in range(num_experts)
-        ])
+        self._last_aux = {
+            "balance": torch.tensor(0.0),
+            "importance": torch.tensor(0.0),
+            "zloss": torch.tensor(0.0),
+            "entropy": torch.tensor(0.0),
+            "total": torch.tensor(0.0),
+        }
 
     @torch.no_grad()
-    def init_from_conv1x1(
-        self,
-        conv1: nn.Conv1d,
-        conv2: nn.Conv1d,
-        noise_std: float = 0.0,
-    ):
+    def init_from_conv1x1(self, conv1, conv2, noise_std: float = 0.0):
         """
-        将原 Dense FFN 的 1x1 Conv 权重复制到所有专家中：
-          conv1: [d_ff, d_model, 1]  -> expert.fc1.weight [d_ff, d_model]
-          conv2: [d_model, d_ff, 1]  -> expert.fc2.weight [d_model, d_ff]
-        expert0 完全拷贝，其他专家可加入微小噪声以打破对称。
+        从 Dense FFN(conv1,conv2: 1x1 Conv 等价 Linear) 初始化 expert0；其余专家加小噪声微扰。
         """
-        # 取出等价 Linear 的权重/偏置
-        W1 = conv1.weight.data.squeeze(-1).clone()        # [d_ff, d_model]
-        b1 = conv1.bias.data.clone() if conv1.bias is not None else None
-        W2 = conv2.weight.data.squeeze(-1).clone()        # [d_model, d_ff]
-        b2 = conv2.bias.data.clone() if conv2.bias is not None else None
+        w1 = conv1.weight.squeeze(-1)  # [d_ff, d_model]
+        b1 = conv1.bias
+        w2 = conv2.weight.squeeze(-1)  # [d_model, d_ff]
+        b2 = conv2.bias
 
-        for idx, expert in enumerate(self.experts):
-            expert.fc1.weight.data.copy_(W1)
-            expert.fc2.weight.data.copy_(W2)
-            if b1 is not None:
-                expert.fc1.bias.data.copy_(b1)
-            if b2 is not None:
-                expert.fc2.bias.data.copy_(b2)
+        def copy_into(expert: ExpertFFN, add_noise: bool):
+            with torch.no_grad():
+                expert.w1.weight.copy_(w1)
+                expert.w1.bias.copy_(b1)
+                expert.w2.weight.copy_(w2)
+                expert.w2.bias.copy_(b2)
+                if add_noise and noise_std > 0:
+                    for p in expert.parameters():
+                        p.add_(noise_std * torch.randn_like(p))
 
-            # 其余专家添加极小扰动，促进分化
-            if noise_std > 0 and idx > 0:
-                expert.fc1.weight.data.add_(torch.randn_like(expert.fc1.weight) * noise_std)
-                if b1 is not None:
-                    expert.fc1.bias.data.add_(torch.randn_like(expert.fc1.bias) * noise_std)
-                expert.fc2.weight.data.add_(torch.randn_like(expert.fc2.weight) * noise_std)
-                if b2 is not None:
-                    expert.fc2.bias.data.add_(torch.randn_like(expert.fc2.bias) * noise_std)
+        copy_into(self.experts[0], add_noise=False)
+        for e in self.experts[1:]:
+            copy_into(e, add_noise=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, L, D]  ->  y: [B, L, D]
-        Top-1 路由：每个 token 只进一个专家，计算量 ≈ Dense FFN
-        """
-        B, L, D = x.shape
-        x_flat = x.reshape(B * L, D)  # [N, D], N=B*L
+    def _routing(self, h: torch.Tensor, training: bool):
+        B, L, D = h.shape
+        T = B * L
+        x = h.reshape(T, D)
 
-        # 计算路由
-        logits = self.router(x_flat)              # [N, E]
-        top1 = torch.argmax(logits, dim=-1)       # [N]
-        y_flat = torch.zeros_like(x_flat)         # 预分配输出
+        logits = self.gate(x)
+        if training and self.gate_noise_std > 0:
+            logits = logits + self.gate_noise_std * torch.randn_like(logits)
+        if self.gate_temp != 1.0:
+            logits = logits / self.gate_temp
 
-        # 逐专家收集/处理/回填
-        for e in range(self.num_experts):
-            mask = (top1 == e)
-            n_tok = mask.sum().item()
-            if n_tok == 0:
+        probs = F.softmax(logits, dim=-1)
+        topk_prob, topk_idx = torch.topk(probs, k=self.top_k, dim=-1)
+
+        importance = probs.sum(dim=0) / T
+        one_hot = torch.zeros_like(probs)
+        one_hot.scatter_(1, topk_idx, 1.0)
+        load = one_hot.sum(dim=0) / T
+
+        zloss = (logits.logsumexp(dim=-1) ** 2).mean()
+        ent = -(probs * (probs.clamp_min(1e-9).log())).sum(dim=-1).mean()
+
+        aux_balance = (importance * load).sum() * self.num_experts
+        aux_importance = (importance * importance).sum() * self.num_experts
+
+        self._last_aux = {
+            "balance": aux_balance.detach(),
+            "importance": aux_importance.detach(),
+            "zloss": zloss.detach(),
+            "entropy": ent.detach(),
+            "total": torch.tensor(0.0),
+        }
+        return topk_idx, topk_prob, logits
+
+    def forward(self, h: torch.Tensor):
+        B, L, D = h.shape
+        T = B * L
+        topk_idx, topk_prob, logits = self._routing(h, self.training)
+
+        capacity = math.ceil(self.capacity_factor * (T * self.top_k / self.num_experts))
+
+        dispatch = [[] for _ in range(self.num_experts)]
+        prob_for_token = [[] for _ in range(self.num_experts)]
+
+        for choice in range(self.top_k):
+            idx = topk_idx[:, choice]
+            prb = topk_prob[:, choice]
+            for e in range(self.num_experts):
+                mask = idx == e
+                if mask.any():
+                    sel = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    if sel.numel() > capacity:
+                        sel = sel[:capacity]
+                    dispatch[e].append(sel)
+                    prob_for_token[e].append(prb[sel])
+
+        out = h.new_zeros(B * L, D)
+        h_flat = h.reshape(T, D)
+        for e, expert in enumerate(self.experts):
+            if len(dispatch[e]) == 0:
                 continue
-            xe = x_flat[mask]                     # [n_tok, D]
-            ye = self.experts[e](xe)              # [n_tok, D]
-            y_flat[mask] = ye
+            sel = torch.cat(dispatch[e], dim=0)
+            w = torch.cat(prob_for_token[e], dim=0).unsqueeze(-1)
+            inp = h_flat[sel]
+            y = expert(inp) * w
+            out.index_add_(0, sel, y)
 
-        y = y_flat.view(B, L, D)
+        y = out.reshape(B, L, D)
+
+        aux_total = 0.0
+        if self.training:
+            if self.lb_alpha > 0:
+                aux_total = aux_total + self.lb_alpha * self._last_aux["balance"]
+            if self.imp_alpha > 0:
+                aux_total = aux_total + self.imp_alpha * self._last_aux["importance"]
+            if self.zloss_beta > 0:
+                aux_total = aux_total + self.zloss_beta * self._last_aux["zloss"]
+            if self.entropy_reg > 0:
+                aux_total = aux_total + self.entropy_reg * self._last_aux["entropy"]
+        self._last_aux["total"] = torch.tensor(float(aux_total))
+
         return y
-

@@ -36,6 +36,14 @@ if __name__ == '__main__':
     parser.add_argument('--use_moe', action='store_true')
     parser.add_argument('--num_experts', type=int, default=8)
     parser.add_argument('--moe_init_noise', type=float, default=0.0)
+    parser.add_argument('--moe_topk', type=int, default=1, help='Top-k experts for routing (1 or 2).')
+    parser.add_argument('--moe_capacity_factor', type=float, default=1.25, help='capacity factor for each expert.')
+    parser.add_argument('--moe_gate_temp', type=float, default=1.0, help='softmax temperature for gating.')
+    parser.add_argument('--moe_gate_noise_std', type=float, default=0.0, help='std of Gaussian noise added to gate logits (training only).')
+    parser.add_argument('--moe_lb_alpha', type=float, default=0.02, help='weight for load-balance loss (importance & load) ala Switch.')
+    parser.add_argument('--moe_imp_alpha', type=float, default=0.0, help='(optional) extra weight for importance loss.')
+    parser.add_argument('--moe_zloss_beta', type=float, default=0.0, help='z-loss weight on router logits (stabilize).')
+    parser.add_argument('--moe_entropy_reg', type=float, default=0.0, help='entropy regularization on router probs.')
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='forecast', help='task name, options:[forecast]')

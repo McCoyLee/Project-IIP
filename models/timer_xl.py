@@ -79,6 +79,14 @@ class Model(nn.Module):
                     use_moe=self.use_moe,
                     num_experts=self.num_experts,
                     moe_init_noise=self.moe_init_noise,
+                    moe_topk=getattr(configs, 'moe_topk', 1),
+                    moe_capacity_factor=getattr(configs, 'moe_capacity_factor', 1.25),
+                    moe_gate_temp=getattr(configs, 'moe_gate_temp', 1.0),
+                    moe_gate_noise_std=getattr(configs, 'moe_gate_noise_std', 0.0),
+                    moe_lb_alpha=getattr(configs, 'moe_lb_alpha', 0.0),
+                    moe_imp_alpha=getattr(configs, 'moe_imp_alpha', 0.0),
+                    moe_zloss_beta=getattr(configs, 'moe_zloss_beta', 0.0),
+                    moe_entropy_reg=getattr(configs, 'moe_entropy_reg', 0.0),
                 )
                 for _ in range(configs.e_layers)
             ],

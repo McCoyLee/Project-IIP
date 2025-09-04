@@ -170,6 +170,14 @@ class Exp_Forecast(Exp_Basic):
                         batch_y = batch_y[:, :, -1]
 
                 loss = criterion(outputs, batch_y)
+                #MoE Improved
+                moe_aux = 0.0
+                for m in self.model.modules():
+                    if hasattr(m, "_moe_aux_total"):
+                        moe_aux = moe_aux + float(m._moe_aux_total.item())
+                if moe_aux != 0.0:
+                    loss = loss + moe_aux
+                #
                 if (i + 1) % 100 == 0:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
                         print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
