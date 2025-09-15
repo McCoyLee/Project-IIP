@@ -9,7 +9,48 @@ from exp.exp_forecast import Exp_Forecast
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Timer-XL')
 
-    # ---- eval options (新增) ----
+    # === Patch tokenization（可选，不给就等于 input_token_len） ===
+    parser.add_argument('--input_token_stride', type=int, default=None,
+                        help='time patch stride; if None, defaults to input_token_len')
+    # ---- AdaRevIN / De-Stationary 开关（新增） ----
+    parser.add_argument('--use_adanorm', action='store_true', default=False,
+                        help='enable AdaRevIN (adaptive reversible instance normalization)')
+    parser.add_argument('--adanorm_alpha', type=str, default='per_channel',
+                        choices=['none','scalar','per_channel','mlp'],
+                        help='alpha type for input-side mixing')
+    parser.add_argument('--adanorm_beta', type=str, default='scalar',
+                        choices=['scalar','per_channel','none'],
+                        help='beta type for output-side mixing')
+    parser.add_argument('--adanorm_use_ema', action='store_true', default=True,
+                        help='use EMA detrending inside AdaRevIN')
+    parser.add_argument('--ema_gamma', type=float, default=0.995,
+                        help='EMA gamma for detrending')
+    parser.add_argument('--use_desta', action='store_true', default=False,
+                        help='enable De-Stationary Attention (logits modulation)')
+
+    # === UniCA：融合阶段（前置/后置）与稳定性超参（都有默认，不传也能跑） ===
+    parser.add_argument('--unica_stage', type=str, default='post',
+                        choices=['pre', 'post'],
+                        help='apply UniCA before encoder (pre) or after encoder (post)')
+
+    parser.add_argument('--unica_res_scale', type=float, default=0.05,
+                        help='residual scale when fusion=res_add')
+    parser.add_argument('--unica_gamma_scale', type=float, default=0.1,
+                        help='gamma perturb scale when fusion=film_gate')
+    parser.add_argument('--unica_beta_scale', type=float, default=0.05,
+                        help='beta shift scale when fusion=film_gate')
+    parser.add_argument('--unica_dropout', type=float, default=0.0,
+                        help='dropout on UniCA condition branch')
+    parser.add_argument('--unica_smooth_gate_ks', type=int, default=3,
+                        help='temporal smoothing kernel for gate (odd)')
+    parser.add_argument('--unica_smooth_beta_ks', type=int, default=3,
+                        help='temporal smoothing kernel for beta (odd)')
+    parser.add_argument('--unica_init_gate_bias', type=float, default=-2.0,
+                        help='initial bias for gate (small gate at start)')
+    parser.add_argument('--unica_init_alpha_bias', type=float, default=-2.0,
+                        help='initial bias for global mixing alpha (small at start)')
+
+# ---- eval options (新增) ----
     parser.add_argument('--eval_target_only', action='store_true',
                     help='only evaluate the target channel (e.g., OT)')
     parser.add_argument('--target_channel', type=int, default=6,
@@ -44,8 +85,13 @@ if __name__ == '__main__':
     parser.add_argument('--moe_imp_alpha', type=float, default=0.0, help='(optional) extra weight for importance loss.')
     parser.add_argument('--moe_zloss_beta', type=float, default=0.0, help='z-loss weight on router logits (stabilize).')
     parser.add_argument('--moe_entropy_reg', type=float, default=0.0, help='entropy regularization on router probs.')
+    # MoE（新增）
+    parser.add_argument('--moe_learnable_temp', action='store_true', default=False)
+    parser.add_argument('--moe_gate_dropout', type=float, default=0.0)
+    parser.add_argument('--moe_kl_alpha', type=float, default=0.0)
 
-    # basic config
+
+# basic config
     parser.add_argument('--task_name', type=str, required=True, default='forecast', help='task name, options:[forecast]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
@@ -83,6 +129,11 @@ if __name__ == '__main__':
     parser.add_argument('--output_attention', action='store_true', help='output attention', default=False)
     parser.add_argument('--visualize', action='store_true', help='visualize', default=False)
     parser.add_argument('--flash_attention', action='store_true', help='flash attention', default=False)
+    # Linear-branch 融合（新增）
+    parser.add_argument('--use_linear_branch', action='store_true', default=False)
+    parser.add_argument('--linear_res_scale', type=float, default=0.2)
+    parser.add_argument('--linear_init_gate', type=float, default=-2.0)
+
 
     # adaptation
     parser.add_argument('--adaptation', action='store_true', help='adaptation', default=False)

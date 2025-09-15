@@ -19,16 +19,18 @@ warnings.filterwarnings('ignore')
 class Exp_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Forecast, self).__init__(args)
-        
+        # 记录 MoE 是否已在本进程中完成启用（convert_dense_ffn_to_moe）
+        self._moe_converted = False
+
     def _build_model(self):
         if self.args.ddp:
             self.device = torch.device('cuda:{}'.format(self.args.local_rank))
         else:
             # for methods that do not use ddp (e.g. finetuning-based LLM4TS models)
             self.device = self.args.gpu
-        
+
         model = self.model_dict[self.args.model].Model(self.args)
-        
+
         if self.args.ddp:
             model = DDP(model.cuda(), device_ids=[self.args.local_rank])
         elif self.args.dp:
@@ -36,7 +38,7 @@ class Exp_Forecast(Exp_Basic):
         else:
             self.device = self.args.gpu
             model = model.to(self.device)
-            
+
         if self.args.adaptation:
             model.load_state_dict(torch.load(self.args.pretrain_model_path))
         return model
@@ -67,8 +69,8 @@ class Exp_Forecast(Exp_Basic):
         time_now = time.time()
         test_steps = len(vali_loader)
         iter_count = 0
-        
-        self.model.eval()    
+
+        self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
                 iter_count += 1
@@ -76,11 +78,11 @@ class Exp_Forecast(Exp_Basic):
                 batch_y = batch_y.float()
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
-                
+
                 outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
                 if is_test or self.args.nonautoregressive:
-                        outputs = outputs[:, -self.args.output_token_len:, :]
-                        batch_y = batch_y[:, -self.args.output_token_len:, :].to(self.device)
+                    outputs = outputs[:, -self.args.output_token_len:, :]
+                    batch_y = batch_y[:, -self.args.output_token_len:, :].to(self.device)
                 else:
                     outputs = outputs[:, :, :]
                     batch_y = batch_y[:, :, :].to(self.device)
@@ -113,21 +115,21 @@ class Exp_Forecast(Exp_Basic):
             total_loss = total_loss.item() / dist.get_world_size()
         else:
             total_loss = np.average(total_loss, weights=total_count)
-            
+
         if self.args.model == 'gpt4ts':
             # GPT4TS just requires to train partial layers
             self.model.in_layer.train()
             self.model.out_layer.train()
-        else: 
+        else:
             self.model.train()
-            
+
         return total_loss
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
-        
+
         path = os.path.join(self.args.checkpoints, setting)
         if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
             if not os.path.exists(path):
@@ -137,14 +139,29 @@ class Exp_Forecast(Exp_Basic):
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(self.args, verbose=True)
-        
+
         model_optim = self._select_optimizer()
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=self.args.tmax, eta_min=1e-8)
         criterion = self._select_criterion()
-        
+
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             self.model.train()
+
+            # ===== [MoE Warmup Enable] 到 warmup 结束时再启用 MoE（若尚未启用） =====
+            if getattr(self.args, 'use_moe', False) and hasattr(self.model, 'convert_dense_ffn_to_moe'):
+                warmup_ep = getattr(self.args, 'moe_warmup_epochs', 5)
+                if (epoch + 1) == warmup_ep and not self._moe_converted:
+                    if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
+                        print(f"[MoE] enabling experts at epoch {epoch+1}")
+                    try:
+                        self.model.convert_dense_ffn_to_moe()
+                        self._moe_converted = True
+                    except Exception as e:
+                        if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
+                            print(f"[MoE] enable failed or already enabled: {e}")
+            # ======================================================================
+
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
@@ -170,14 +187,25 @@ class Exp_Forecast(Exp_Basic):
                         batch_y = batch_y[:, :, -1]
 
                 loss = criterion(outputs, batch_y)
-                #MoE Improved
-                moe_aux = 0.0
+
+                # ==== MoE aux：平均 + 系数 + warmup（warmup 期不加） ====
+                moe_terms = []
                 for m in self.model.modules():
                     if hasattr(m, "_moe_aux_total"):
-                        moe_aux = moe_aux + float(m._moe_aux_total.item())
-                if moe_aux != 0.0:
-                    loss = loss + moe_aux
-                #
+                        aux = m._moe_aux_total
+                        if not torch.is_tensor(aux):
+                            aux = torch.tensor(float(aux), device=self.device)
+                        else:
+                            aux = aux.to(self.device)
+                        moe_terms.append(aux)
+                if moe_terms:
+                    moe_aux = torch.stack(moe_terms).mean()  # 先对所有层取平均
+                    coef = getattr(self.args, "moe_aux_coef", 0.1)
+                    warm = getattr(self.args, "moe_warmup_epochs", 5)
+                    if epoch + 1 > warm:  # warmup 期间不加入 aux
+                        loss = loss + coef * moe_aux
+                # =====================================================
+
                 if (i + 1) % 100 == 0:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
                         print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -188,6 +216,8 @@ class Exp_Forecast(Exp_Basic):
                         time_now = time.time()
 
                 loss.backward()
+                # 梯度裁剪，稳定 MoE 路由训练
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 model_optim.step()
 
             if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
@@ -211,7 +241,7 @@ class Exp_Forecast(Exp_Basic):
                 adjust_learning_rate(model_optim, epoch + 1, self.args)
             if self.args.ddp:
                 train_loader.sampler.set_epoch(epoch + 1)
-                
+
         best_model_path = path + '/' + 'checkpoint.pth'
         if self.args.ddp:
             dist.barrier()
@@ -234,7 +264,7 @@ class Exp_Forecast(Exp_Basic):
                 if not param.requires_grad and name not in checkpoint:
                     checkpoint[name] = param
             self.model.load_state_dict(checkpoint)
-            
+
         preds = []
         trues = []
         folder_path = './test_results/' + setting + '/'
@@ -251,24 +281,34 @@ class Exp_Forecast(Exp_Basic):
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
-                
-                # 推理步数：按 output_token_len 逐段滚动到 test_pred_len
-                inference_steps = self.args.test_pred_len // self.args.output_token_len
-                dis = self.args.test_pred_len - inference_steps * self.args.output_token_len
-                if dis != 0:
+
+                # 逐段滚动到 test_pred_len
+                out_len = self.args.output_token_len
+                inference_steps = self.args.test_pred_len // out_len
+                if self.args.test_pred_len % out_len != 0:
                     inference_steps += 1
-                pred_y = []
-                for j in range(inference_steps):  
-                    if len(pred_y) != 0:
-                        # 把上一步预测拼接到输入末尾，继续滚动预测
-                        batch_x = torch.cat([batch_x[:, self.args.input_token_len:, :], pred_y[-1]], dim=1)
+
+                pred_segs = []
+                for j in range(inference_steps):
+                    if len(pred_segs) != 0:
+                        # 1) 输入序列滚动 out_len 步
+                        batch_x = torch.cat([batch_x[:, out_len:, :], pred_segs[-1]], dim=1)
+                        # 2) 时间戳也同步滚动 out_len 步；从 y_mark 取第 j 段时间戳接到末尾
+                        start = (j - 1) * out_len
+                        end = min(j * out_len, batch_y_mark.size(1))
+                        seg = batch_y_mark[:, start:end, :]
+                        if seg.size(1) < out_len:
+                            # 末段不够则用最后一个时间戳做简单填充
+                            seg = torch.cat([seg, seg[:, -1:, :].repeat(1, out_len - seg.size(1), 1)], dim=1)
+                        batch_x_mark = torch.cat([batch_x_mark[:, out_len:, :], seg], dim=1)
+
                     outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
-                    pred_y.append(outputs[:, -self.args.output_token_len:, :])
-                pred_y = torch.cat(pred_y, dim=1)
-                if dis != 0:
-                    pred_y = pred_y[:, :-self.args.output_token_len+dis, :]
+                    pred_segs.append(outputs[:, -out_len:, :])
+
+                # 拼接所有段，并裁成 test_pred_len
+                pred_y = torch.cat(pred_segs, dim=1)[:, :self.args.test_pred_len, :]
                 batch_y = batch_y[:, -self.args.test_pred_len:, :].to(self.device)
-                
+
                 outputs = pred_y.detach().cpu()
                 batch_y = batch_y.detach().cpu()
                 pred = outputs
@@ -331,4 +371,3 @@ class Exp_Forecast(Exp_Basic):
         f.write('\n')
         f.close()
         return
-
