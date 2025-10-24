@@ -1,6 +1,5 @@
-# models/timer_xl.py
 import torch
-import math
+import torch.nn.functional as F
 from torch import nn
 from typing import Dict, Any
 
@@ -8,30 +7,115 @@ from layers.Transformer_EncDec import TimerBlock, TimerLayer
 from layers.SelfAttention_Family import AttentionLayer, TimeAttention
 from layers.unica_cov import UniCAFiLM
 from models.revin import RevIN
-from utils.adaptive_norm import AdaRevIN                     # <<< 新增
-from layers.de_stationary_attention import DeStationaryAdapter  # <<< 新增
+from utils.adaptive_norm import AdaRevIN
+from layers.de_stationary_attention import DeStationaryAdapter
+
+# ★ PatchTST 风格前端与聚合头
+from layers.patch import PatchEmbed1D, PatchUnembedHead
+
+# ============================================================
+# ★★★ 内联实现：AFS-Gate（自适应频率选择门） ★★★
+# 为了便于直接替换，本文件内联 AFS，避免额外新建 layers/afs_gate.py
+# ============================================================
+class _TriangularBank(nn.Module):
+    """K个可学习三角带通窗，频率轴归一到 [0,1]。"""
+    def __init__(self, K: int, init_centers=None, init_width=0.25):
+        super().__init__()
+        self.K = K
+        if init_centers is None:
+            init_centers = torch.linspace(0.05, 0.95, K)
+        self.centers = nn.Parameter(init_centers.clone())            # 学习中心 c_k
+        self.widths  = nn.Parameter(torch.full((K,), float(init_width)))  # 学习宽度 w_k
+
+    def forward(self, F_bins: int, device=None, dtype=None):
+        f = torch.linspace(0, 1, F_bins, device=device, dtype=dtype)    # 频率坐标
+        c = torch.sigmoid(self.centers).unsqueeze(1)                    # [K,1]
+        w = F.softplus(self.widths).unsqueeze(1) + 1e-6                 # [K,1] > 0
+        W = torch.relu(1.0 - torch.abs(f.unsqueeze(0) - c) / w)         # [K,F] 三角窗
+        W = W / (W.sum(dim=-1, keepdim=True) + 1e-9)                    # 每带归一化
+        return W
+
+class AdaptiveFreqGate(nn.Module):
+    """
+    AFS-Gate：rFFT→K带能量→alpha=softmax→频谱掩码→iFFT→FiLM/残差
+    输入:  x [B, L, D]
+    输出:  y [B, L, D], alpha [B, K]
+    """
+    def __init__(self, d_model: int, K: int = 8, use_film: bool = True,
+                 res_scale: float = 0.2, init_gamma: float = 0.0):
+        super().__init__()
+        self.K = K
+        self.use_film = use_film
+        self.res_scale = res_scale
+
+        self.bank = _TriangularBank(K)
+        self.alpha_mlp = nn.Sequential(
+            nn.Linear(K, K), nn.ReLU(inplace=True),
+            nn.Linear(K, K)
+        )
+        self.gamma = nn.Parameter(torch.tensor(init_gamma))  # 频谱掩码强度
+
+        if use_film:
+            self.film = nn.Linear(K, 2 * d_model)
+            nn.init.zeros_(self.film.weight); nn.init.zeros_(self.film.bias)
+
+    def forward(self, x):
+        # x: [B, L, D]
+        B, L, D = x.shape
+        xt = x.transpose(1, 2)                       # [B, D, L]
+        Xf = torch.fft.rfft(xt, dim=-1)              # [B, D, F]
+        Fbins = Xf.shape[-1]
+        W = self.bank(Fbins, device=Xf.device, dtype=Xf.real.dtype)  # [K, F]
+
+        power = (Xf.real**2 + Xf.imag**2)            # [B, D, F]
+        band_power = torch.einsum('bdf,kf->bdk', power, W)  # [B, D, K]
+        band_power = band_power.mean(dim=1)          # [B, K]
+
+        alpha_logits = self.alpha_mlp(band_power)    # [B, K]
+        alpha = torch.softmax(alpha_logits, dim=-1)  # [B, K]
+
+        M = torch.einsum('bk,kf->bf', alpha, W).unsqueeze(1)  # [B,1,F]
+        Xf_masked = Xf * (1.0 + self.gamma * M)
+        xt_filt = torch.fft.irfft(Xf_masked, n=L, dim=-1)     # [B, D, L]
+        x_filt = xt_filt.transpose(1, 2)                      # [B, L, D]
+
+        if self.use_film:
+            film_params = self.film(alpha)        # [B, 2D]
+            scale, bias = film_params.chunk(2, dim=-1)
+            y = x_filt * (1 + scale.unsqueeze(1)) + bias.unsqueeze(1)
+        else:
+            y = x_filt
+
+        out = x + self.res_scale * y              # 残差融合（恒等起步稳）
+        return out, alpha
+# ======================= AFS 结束 ============================
 
 
 class Model(nn.Module):
     """
-    Timer-XL: Long-Context Transformers for Unified Time Series Forecasting
-    Paper: https://arxiv.org/abs/2410.04803
-    GitHub: https://github.com/thuml/Timer-XL
+    Timer-XL with PatchTST-style tokenization (+ optional CI backbone and heads)
     """
     def __init__(self, configs):
         super().__init__()
-        # ---- patch tokenization ----
-        self.input_token_len = configs.input_token_len
-        self.input_token_stride = getattr(configs, 'input_token_stride', None)
-        if self.input_token_stride is None:
-            self.input_token_stride = self.input_token_len
-        self.embedding = nn.Linear(self.input_token_len, configs.d_model)
+        self.configs = configs
 
-        # ---- flags ----
+        # ====== Patch 参数 ======
+        self.patch_len = configs.input_token_len
+        self.patch_stride = getattr(configs, 'input_token_stride', None)
+        if self.patch_stride is None:
+            self.patch_stride = self.patch_len
+
+        # ====== CI 主干与预测头类型 ======
+        self.ci_backbone = getattr(configs, 'ci_backbone', False)
+        self.head_type = getattr(configs, 'head_type', 'last')  # 'last' | 'mean' | 'tokenwise'
+        if self.ci_backbone and self.head_type == 'tokenwise':
+            print("[Timer-XL] CI 模式下不推荐 tokenwise 头，已强制改为 'last'")
+            self.head_type = 'last'
+
+        # ====== 归一化系列 ======
         self.output_attention = configs.output_attention
-        self.use_norm = configs.use_norm  # 与 RevIN/AdaRevIN 互斥；开 AdaRevIN/RevIN 时请关 use_norm
+        self.use_norm = configs.use_norm
 
-        # ---- AdaRevIN（优先） / RevIN / use_norm ----
         self.use_adanorm = getattr(configs, 'use_adanorm', False)
         if self.use_adanorm:
             self.adanorm = AdaRevIN(
@@ -51,20 +135,15 @@ class Model(nn.Module):
             eps=getattr(configs, 'revin_eps', 1e-5),
         ) if getattr(configs, 'revin', False) and (not self.use_adanorm) else None
 
-        # ---- MoE 配置（透传到 TimerLayer；保持预训练兼容）----
-        self.use_moe = getattr(configs, 'use_moe', False)
-        self.num_experts = getattr(configs, 'num_experts', 8)
-        self.moe_init_noise = getattr(configs, 'moe_init_noise', 0.0)
-
-        # ---- UniCA 协变量同质化 + 轻量融合（可选）----
+        # ====== UniCA ======
         self.use_unica = getattr(configs, 'use_unica', False)
-        self.unica_stage = getattr(configs, 'unica_stage', 'post')  # 'pre' / 'post'
+        self.unica_stage = getattr(configs, 'unica_stage', 'post')
         self.target_channel = getattr(configs, 'target_channel', -1)
         if self.use_unica:
             self.unica = UniCAFiLM(
                 d_model=configs.d_model,
                 bottleneck=getattr(configs, 'unica_bottleneck', 128),
-                input_token_len=configs.input_token_len,
+                input_token_len=self.patch_len,
                 exclude_target=getattr(configs, 'unica_exclude_target', False),
                 fusion=getattr(configs, 'unica_fusion', 'res_add'),
                 gamma_scale=getattr(configs, 'unica_gamma_scale', 0.1),
@@ -79,7 +158,22 @@ class Model(nn.Module):
         else:
             self.unica = None
 
-        # ---- 主干块 ----
+        # ====== AFS-Gate（可选）======
+        self.use_afs_gate = getattr(configs, 'use_afs_gate', False)
+        self.afs_place = getattr(configs, 'afs_place', 'block_post')
+        self.afs_as_moe_prior = getattr(configs, 'afs_as_moe_prior', False)
+        if self.use_afs_gate:
+            self.afs_gate = AdaptiveFreqGate(
+                d_model=configs.d_model,
+                K=getattr(configs, 'afs_bands', 8),
+                res_scale=getattr(configs, 'afs_res_scale', 0.2),
+                init_gamma=getattr(configs, 'afs_init_gamma', 0.0),
+            )
+        else:
+            self.afs_gate = None
+        self._freq_prior = None  # 缓存 alpha，供需要时读取（MoE 先验等）
+
+        # ====== 主干（共享）======
         self.blocks = TimerBlock(
             [
                 TimerLayer(
@@ -100,9 +194,9 @@ class Model(nn.Module):
                     configs.d_ff,
                     dropout=configs.dropout,
                     activation=configs.activation,
-                    use_moe=self.use_moe,
-                    num_experts=self.num_experts,
-                    moe_init_noise=self.moe_init_noise,
+                    use_moe=getattr(configs, 'use_moe', False),
+                    num_experts=getattr(configs, 'num_experts', 8),
+                    moe_init_noise=getattr(configs, 'moe_init_noise', 0.0),
                     moe_topk=getattr(configs, 'moe_topk', 1),
                     moe_capacity_factor=getattr(configs, 'moe_capacity_factor', 1.25),
                     moe_gate_temp=getattr(configs, 'moe_gate_temp', 1.0),
@@ -111,17 +205,13 @@ class Model(nn.Module):
                     moe_imp_alpha=getattr(configs, 'moe_imp_alpha', 0.0),
                     moe_zloss_beta=getattr(configs, 'moe_zloss_beta', 0.0),
                     moe_entropy_reg=getattr(configs, 'moe_entropy_reg', 0.0),
-                    # <<< 新增三项透传 >>>
-                    moe_learnable_temp=getattr(configs, 'moe_learnable_temp', False),
-                    moe_gate_dropout=getattr(configs, 'moe_gate_dropout', 0.0),
-                    moe_kl_alpha=getattr(configs, 'moe_kl_alpha', 0.0),
                 )
                 for _ in range(configs.e_layers)
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model),
         )
 
-        # ---- De-Stationary Attention 适配器（可选）----
+        # ====== De-Stationary（可选）======
         self.use_desta = getattr(configs, 'use_desta', False)
         if self.use_desta:
             self.desta = DeStationaryAdapter(
@@ -129,148 +219,187 @@ class Model(nn.Module):
                 nheads=configs.n_heads,
                 hidden=128
             )
-            # 安装到每一层 TimeAttention 上
             for m in self.modules():
                 if hasattr(m, 'inner_attention') and hasattr(m.inner_attention, 'desta'):
                     m.inner_attention.desta = self.desta
         else:
             self.desta = None
 
-        # ---- 输出头（token -> 原步长）----
-        self.head = nn.Linear(configs.d_model, configs.output_token_len)
+        # ====== Patch 前端 + 预测头 ======
+        self.patch = PatchEmbed1D(
+            patch_len=self.patch_len,
+            stride=self.patch_stride,
+            d_model=configs.d_model,
+            add_pos=True,
+            pos_learnable=False,
+        )
+        self.head = PatchUnembedHead(
+            d_model=configs.d_model,
+            pred_len=configs.output_token_len,
+            head_type=self.head_type,
+            token_out_len=configs.output_token_len if self.head_type == 'tokenwise' else None,
+            stride_equals_patch=(self.patch_stride == self.patch_len),
+        )
 
-        # ---- Linear branch (DLinear-style residual) ----
-        self.use_linear_branch = getattr(configs, 'use_linear_branch', False)
-        if self.use_linear_branch:
-            self.linear_head = nn.Linear(self.input_token_len, configs.output_token_len)
-            init_gate = getattr(configs, 'linear_init_gate', -2.0)  # 初始偏关
-            self.linear_gate = nn.Parameter(torch.tensor(float(init_gate)))
-            self.linear_res_scale = getattr(configs, 'linear_res_scale', 0.2)
-
-    def forecast(self, x, x_mark, y_mark):
-        """
-        x:      [B, L, C]
-        x_mark: [B, L, M] 或 None（时间特征）
-        y_mark: 兼容占位
-        """
-        # ---------------- 前置归一化 ----------------
-        x_raw = x.clone()  # UniCA 使用原尺度
+    # ---------- 归一化 ----------
+    def _pre_norm(self, x):
+        x_raw = x
         revin_stats = None
-        extra_ctx = {}
-
         if self.adanorm is not None:
-            x, stats, _ = self.adanorm.forward_in(x)  # AdaRevIN
-            extra_ctx['stats'] = stats
-        elif self.revin is not None:
+            x, stats, _ = self.adanorm.forward_in(x)
+            return x, x_raw, ("adanorm", stats)
+        if self.revin is not None:
             x, revin_stats = self.revin(x, mode='norm')
-        elif self.use_norm:
+            return x, x_raw, ("revin", revin_stats)
+        if self.use_norm:
             means = x.mean(1, keepdim=True).detach()
-            x = x - means
             stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + 1e-5)
-            x = x / stdev
+            x = (x - means) / stdev
+            return x, x_raw, ("stat", (means, stdev))
+        return x, x_raw, None
 
+    def _post_denorm(self, y, ctx):
+        if ctx is None:
+            return y
+        kind, obj = ctx
+        if kind == "adanorm":
+            return self.adanorm.forward_out(y)
+        if kind == "revin":
+            return self.revin(y, mode='denorm', stats=obj)
+        if kind == "stat":
+            means, stdev = obj
+            return y * stdev + means
+        return y
+
+    def forecast(self, x, x_mark=None, y_mark=None):
+        """
+        x: [B, L, C]
+        return:
+          - 若 head_type in {'last','mean'}: [B, H, C]
+          - 若 head_type == 'tokenwise'    : [B, L, C] (仅 stride==patch_len)
+        """
+        # ---------- 归一化 ----------
+        x, x_raw, ctx = self._pre_norm(x)
         B, L, C = x.shape
-        x_for_cov = x_raw  # UniCA 用原尺度协变量
 
-        # ---- 保证长度可被 patch 大小整除（容错兜底）----
-        P = self.input_token_len
-        L = x.size(1)
-        if L % P != 0:
-            Lp = (L // P) * P     # 向下取整
-            x = x[:, :Lp, :]
-            x_raw = x_raw[:, :Lp, :]
-            if x_mark is not None:
-                x_mark = x_mark[:, :Lp, :]
+        # ---------- Patch tokenize ----------
+        tokens, meta = self.patch(x)     # tokens: [B*C, N, d], meta=(B,C,N)
+        Bm, Cm, N = meta
+        assert Bm == B and Cm == C
 
-        # ---------------- Patch tokenization ----------------
-        x_tok = x.permute(0, 2, 1)
-        if self.input_token_stride != self.input_token_len:
-            raise NotImplementedError("当前实现只支持非重叠 patch；如需 stride < len，请先实现 overlap-add 聚合。")
-        x_tok = x_tok.unfold(dimension=-1, size=self.input_token_len, step=self.input_token_stride)  # [B, C, N, P]
-        N = x_tok.shape[2]
+        # ---------- （可选）UniCA 前置 ----------
+        if self.use_unica and self.unica_stage == 'pre':
+            z4u = tokens.view(B, C, N, -1).reshape(B, C * N, -1)
+            z4u = self.unica(z4u, x_raw, x_mark, target_channel=self.target_channel)
+            tokens = z4u.view(B, C, N, -1).view(B * C, N, -1)
 
-        # ---------------- Linear embed per token ----------------
-        embed_out = self.embedding(x_tok)            # [B, C, N, D]
-        embed_out = embed_out.reshape(B, C * N, -1)  # [B, C*N, D]
+        # ---------- （可选）AFS block_pre ----------
+        self._freq_prior = None
+        if self.afs_gate is not None and self.afs_place == 'block_pre':
+            t_in = tokens.view(B, C * N, -1)              # [B, C*N, d] 走一遍时域AFS更自然
+            t_in, alpha = self.afs_gate(t_in)             # [B, C*N, d], [B, K]
+            tokens = t_in.view(B, C, N, -1).view(B * C, N, -1)
+            if self.afs_as_moe_prior:
+                self._freq_prior = alpha.detach()         # 缓存；需要时外部可读取
 
-        # 【可选】前置融合
-        if self.unica is not None and self.unica_stage == 'pre':
-            embed_out = self.unica(embed_out, x_for_cov, x_mark, target_channel=self.target_channel)
-
-        # ---------------- Timer-XL 主干 ----------------
-        embed_out, attns = self.blocks(embed_out, n_vars=C, n_tokens=N, extra_ctx=extra_ctx)
-
-        # 【推荐】后置融合
-        if self.unica is not None and self.unica_stage == 'post':
-            embed_out = self.unica(embed_out, x_for_cov, x_mark, target_channel=self.target_channel)
-
-        # ---------------- 两路头 + 融合 ----------------
-        dec_main = self.head(embed_out)  # [B, C*N, P]
-        if self.use_linear_branch:
-            lin_out = self.linear_head(x_tok)               # [B, C, N, P]
-            lin_out = lin_out.reshape(B, C * N, -1)         # [B, C*N, P]
-            gate = torch.sigmoid(self.linear_gate) * self.linear_res_scale
-            dec_out = dec_main + gate * lin_out
+        # ---------- 编码器 ----------
+        attns = None
+        if self.ci_backbone:
+            # CI：batch = B*C, len = N
+            ret = self.blocks(tokens, n_vars=1, n_tokens=N)
+            if isinstance(ret, tuple):
+                z, attns = ret
+            else:
+                z = ret
         else:
-            dec_out = dec_main
+            z_in = tokens.view(B, C, N, -1).reshape(B, C * N, -1)
+            ret = self.blocks(z_in, n_vars=C, n_tokens=N)
+            if isinstance(ret, tuple):
+                z_in, attns = ret
+            else:
+                z_in = ret
+            z = z_in.view(B, C, N, -1).view(B * C, N, -1)
 
-        # ---------------- 还原为序列 ----------------
-        dec_out = dec_out.reshape(B, C, N, -1).reshape(B, C, -1).permute(0, 2, 1)  # [B, L, C]
+        assert isinstance(z, torch.Tensor) and z.dim() == 3 and z.shape[0] == B * C and z.shape[1] == N, \
+            f"[shapes] z={type(z)} {getattr(z,'shape',None)}, expected (B*C,N,d)"
 
-        # ---------------- 后置反归一化 ----------------
-        if self.adanorm is not None:
-            dec_out = self.adanorm.forward_out(dec_out)
-        elif self.revin is not None:
-            dec_out = self.revin(dec_out, mode='denorm', stats=revin_stats)
-        elif self.use_norm:
-            dec_out = dec_out * stdev + means
+        # ---------- （可选）UniCA 后置 ----------
+        if self.use_unica and self.unica_stage == 'post':
+            if self.ci_backbone:
+                pass
+            else:
+                z4u = z.view(B, C, N, -1).reshape(B, C * N, -1)
+                z4u = self.unica(z4u, x_raw, x_mark, target_channel=self.target_channel)
+                z = z4u.view(B, C, N, -1).view(B * C, N, -1)
+
+        # ---------- （可选）AFS block_post ----------
+        if self.afs_gate is not None and self.afs_place == 'block_post':
+            z_in = z.view(B, C, N, -1).reshape(B, C * N, -1)    # [B, C*N, d]
+            z_out, alpha = self.afs_gate(z_in)                  # [B, C*N, d], [B, K]
+            z = z_out.view(B, C, N, -1).view(B * C, N, -1)
+            if self.afs_as_moe_prior:
+                self._freq_prior = alpha.detach()
+
+        # ---------- 预测头 ----------
+        out = self.head(z, meta)  # 'last/mean' -> (B,C,H) ; 'tokenwise' -> (B,L,C)
+
+        if self.head_type in ("last", "mean"):
+            out = out.transpose(1, 2)  # (B,C,H) -> (B,H,C)
+
+            # CI + post-UniCA：在 (B,H,C) 上做轻量跨变量融合（可选）
+            if self.use_unica and self.unica_stage == 'post' and self.ci_backbone:
+                if not hasattr(self, 'post_ci_fuse'):
+                    self.post_ci_fuse = nn.Conv1d(in_channels=C, out_channels=C, kernel_size=1, bias=True).to(out.device)
+                elif self.post_ci_fuse.weight.device != out.device:
+                    self.post_ci_fuse = self.post_ci_fuse.to(out.device)
+                out = out.permute(0, 2, 1)     # (B,H,C) -> (B,C,H)
+                out = self.post_ci_fuse(out)   # (B,C,H)
+                out = out.permute(0, 2, 1)     # (B,C,H) -> (B,H,C)
+
+        # ---------- 反归一化 ----------
+        out = self._post_denorm(out, ctx)
 
         if self.output_attention:
-            return dec_out, attns
-        return dec_out
+            return out, attns
+        return out
 
-    def forward(self, x, x_mark, y_mark):
+    def forward(self, x, x_mark=None, y_mark=None):
         return self.forecast(x, x_mark, y_mark)
 
+    # ====== MoE 工具保持不变 ======
     @torch.no_grad()
     def convert_dense_ffn_to_moe(self):
-        if not self.use_moe:
+        if not getattr(self.configs, 'use_moe', False):
             return
         for m in self.modules():
             if isinstance(m, TimerLayer) and getattr(m, 'use_moe_flag', False):
                 m.enable_moe()
 
     def moe_aux_loss(self) -> torch.Tensor:
-        device = self.head.weight.device
+        device = next(self.parameters()).device
         aux_vals = []
         for m in self.modules():
             if isinstance(m, TimerLayer) and getattr(m, 'use_moe_flag', False):
-                aux_val = None
+                aux = None
                 if hasattr(m, 'ffn') and hasattr(m.ffn, '_last_aux'):
                     last_aux = m.ffn._last_aux
                     if isinstance(last_aux, dict) and 'total_live' in last_aux:
-                        aux_val = last_aux['total_live']
+                        aux = last_aux['total_live']
                     elif isinstance(last_aux, dict) and 'total' in last_aux:
-                        aux_val = last_aux['total']
-                if aux_val is None and hasattr(m, '_moe_aux_total'):
-                    aux_val = m._moe_aux_total
-                if aux_val is not None:
-                    if not torch.is_tensor(aux_val):
-                        aux_val = torch.tensor(float(aux_val), device=device)
-                    aux_vals.append(aux_val)
+                        aux = last_aux['total']
+                if aux is None and hasattr(m, '_moe_aux_total'):
+                    aux = m._moe_aux_total
+                if aux is not None:
+                    aux_vals.append(torch.as_tensor(aux, device=device, dtype=torch.float32))
         if not aux_vals:
             return torch.tensor(0.0, device=device)
         return torch.stack(aux_vals).mean()
 
     @torch.no_grad()
     def moe_metrics(self) -> Dict[str, Any]:
-        device = self.head.weight.device
-        acc: Dict[str, float] = {}
-        cnt = 0
-
+        acc, cnt = {}, 0
         def _add(k, v):
             acc[k] = acc.get(k, 0.0) + float(v)
-
         for m in self.modules():
             if isinstance(m, TimerLayer) and getattr(m, 'use_moe_flag', False):
                 if hasattr(m, 'ffn') and hasattr(m.ffn, '_last_aux'):
@@ -278,28 +407,19 @@ class Model(nn.Module):
                     if isinstance(aux, dict):
                         for k in ['total', 'assigned_frac', 'balance_switch', 'balance_kl', 'entropy', 'zloss']:
                             if k in aux:
-                                v = aux[k]
-                                v = v.item() if torch.is_tensor(v) else float(v)
-                                _add(f"moe/{k}", v)
+                                vv = aux[k]
+                                _add(f"moe/{k}", vv.item() if torch.is_tensor(vv) else float(vv))
                         cnt += 1
                 if hasattr(m, '_moe_aux_total'):
-                    v = m._moe_aux_total
-                    v = v.item() if torch.is_tensor(v) else float(v)
-                    _add("moe/total", v)
+                    vv = m._moe_aux_total
+                    _add("moe/total", vv.item() if torch.is_tensor(vv) else float(vv))
                     if "moe/assigned_frac" not in acc:
                         acc["moe/assigned_frac"] = 1.0
                     cnt = max(cnt, 1)
-
         if cnt == 0:
-            return {
-                "moe/aux_total": 0.0,
-                "moe/assigned_frac": 0.0,
-                "moe/balance_switch": 0.0,
-                "moe/balance_kl": 0.0,
-                "moe/entropy": 0.0,
-                "moe/zloss": 0.0,
-            }
-
+            return {k: 0.0 for k in [
+                "moe/aux_total","moe/assigned_frac","moe/balance_switch","moe/balance_kl","moe/entropy","moe/zloss"
+            ]}
         return {
             "moe/aux_total": acc.get("moe/total", 0.0) / cnt,
             "moe/assigned_frac": acc.get("moe/assigned_frac", 0.0) / cnt,

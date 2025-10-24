@@ -63,6 +63,28 @@ class Exp_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _align_target(self, outputs, batch_y):
+        """
+        将 batch_y 对齐到模型输出：取最后 pred_len 步，并按需选择目标通道。
+        同时裁剪 outputs 到最后 pred_len 步（更稳健，兼容部分模型返回更长序列的情况）。
+        """
+        pred_len = self.args.output_token_len
+
+        # 裁剪到最后 pred_len 步
+        outputs = outputs[:, -pred_len:, :]
+        batch_y = batch_y[:, -pred_len:, :]
+
+        # 只评估目标通道
+        if getattr(self.args, 'eval_target_only', False):
+            tc = int(getattr(self.args, 'target_channel', -1))
+            C = outputs.shape[-1]
+            if tc < 0 or tc >= C:
+                tc = C - 1
+            outputs = outputs[..., tc:tc+1]
+            batch_y = batch_y[..., tc:tc+1]
+
+        return outputs, batch_y
+
     def vali(self, vali_data, vali_loader, criterion, is_test=False):
         total_loss = []
         total_count = []
@@ -75,17 +97,14 @@ class Exp_Forecast(Exp_Basic):
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
                 iter_count += 1
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
+                batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
                 outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
-                if is_test or self.args.nonautoregressive:
-                    outputs = outputs[:, -self.args.output_token_len:, :]
-                    batch_y = batch_y[:, -self.args.output_token_len:, :].to(self.device)
-                else:
-                    outputs = outputs[:, :, :]
-                    batch_y = batch_y[:, :, :].to(self.device)
+
+                # 对齐标签与输出
+                outputs, batch_y = self._align_target(outputs, batch_y)
 
                 # 原有 covariate 逻辑（可选，仅在 args.covariate=True 时启用）
                 if self.args.covariate:
@@ -174,8 +193,9 @@ class Exp_Forecast(Exp_Basic):
                 outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
                 if self.args.dp:
                     torch.cuda.synchronize()
-                if self.args.nonautoregressive:
-                    batch_y = batch_y[:, -self.args.output_token_len:, :]
+
+                # 对齐标签与输出（总是取最后 pred_len 步；可选目标通道）
+                outputs, batch_y = self._align_target(outputs, batch_y)
 
                 # 原有 covariate 逻辑（可选）
                 if self.args.covariate:
@@ -197,7 +217,8 @@ class Exp_Forecast(Exp_Basic):
                             aux = torch.tensor(float(aux), device=self.device)
                         else:
                             aux = aux.to(self.device)
-                        moe_terms.append(aux)
+                        if torch.isfinite(aux):
+                            moe_terms.append(aux)
                 if moe_terms:
                     moe_aux = torch.stack(moe_terms).mean()  # 先对所有层取平均
                     coef = getattr(self.args, "moe_aux_coef", 0.1)
@@ -206,14 +227,12 @@ class Exp_Forecast(Exp_Basic):
                         loss = loss + coef * moe_aux
                 # =====================================================
 
-                if (i + 1) % 100 == 0:
+                # ===== NaN/Inf 保护：发现非有限 loss 就跳过该步 =====
+                if not torch.isfinite(loss):
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
-                        print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                        speed = (time.time() - time_now) / iter_count
-                        left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                        print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                        iter_count = 0
-                        time_now = time.time()
+                        print("[warn] non-finite loss detected (NaN/Inf). Skip step.")
+                    model_optim.zero_grad()
+                    continue
 
                 loss.backward()
                 # 梯度裁剪，稳定 MoE 路由训练
@@ -345,7 +364,6 @@ class Exp_Forecast(Exp_Basic):
         print('trues shape:', trues.shape)
 
         # ============ 只评目标通道（例如 OT） ============
-        # 需要在命令行传：--eval_target_only --target_channel 6
         if getattr(self.args, 'eval_target_only', False):
             c = int(getattr(self.args, 'target_channel', -1))
             C = preds.shape[-1]
