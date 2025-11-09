@@ -13,6 +13,10 @@ from exp.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 
+# === AMP 相关 ===
+from torch.cuda.amp import autocast, GradScaler
+torch.set_float32_matmul_precision("high")  # 可选：在 Ampere+/Ada 上略提速
+
 warnings.filterwarnings('ignore')
 
 
@@ -21,6 +25,9 @@ class Exp_Forecast(Exp_Basic):
         super(Exp_Forecast, self).__init__(args)
         # 记录 MoE 是否已在本进程中完成启用（convert_dense_ffn_to_moe）
         self._moe_converted = False
+
+        # AMP GradScaler（DDP/DP/单卡通用）
+        self.scaler = GradScaler(enabled=True)
 
     def _build_model(self):
         if self.args.ddp:
@@ -101,21 +108,23 @@ class Exp_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
+                # AMP 推理
+                with autocast(dtype=torch.float16):
+                    outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
 
-                # 对齐标签与输出
-                outputs, batch_y = self._align_target(outputs, batch_y)
+                    # 对齐标签与输出
+                    outputs, batch_y = self._align_target(outputs, batch_y)
 
-                # 原有 covariate 逻辑（可选，仅在 args.covariate=True 时启用）
-                if self.args.covariate:
-                    if self.args.last_token:
-                        outputs = outputs[:, -self.args.output_token_len:, -1]
-                        batch_y = batch_y[:, -self.args.output_token_len:, -1]
-                    else:
-                        outputs = outputs[:, :, -1]
-                        batch_y = batch_y[:, :, -1]
+                    # 原有 covariate 逻辑（可选，仅在 args.covariate=True 时启用）
+                    if self.args.covariate:
+                        if self.args.last_token:
+                            outputs = outputs[:, -self.args.output_token_len:, -1]
+                            batch_y = batch_y[:, -self.args.output_token_len:, -1]
+                        else:
+                            outputs = outputs[:, :, -1]
+                            batch_y = batch_y[:, :, -1]
 
-                loss = criterion(outputs, batch_y)
+                    loss = criterion(outputs, batch_y)
 
                 loss = loss.detach().cpu()
                 total_loss.append(loss)
@@ -190,42 +199,44 @@ class Exp_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
-                if self.args.dp:
-                    torch.cuda.synchronize()
+                # === AMP：前向与损失 ===
+                with autocast(dtype=torch.float16):
+                    outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
+                    if self.args.dp:
+                        torch.cuda.synchronize()
 
-                # 对齐标签与输出（总是取最后 pred_len 步；可选目标通道）
-                outputs, batch_y = self._align_target(outputs, batch_y)
+                    # 对齐标签与输出（总是取最后 pred_len 步；可选目标通道）
+                    outputs, batch_y = self._align_target(outputs, batch_y)
 
-                # 原有 covariate 逻辑（可选）
-                if self.args.covariate:
-                    if self.args.last_token:
-                        outputs = outputs[:, -self.args.output_token_len:, -1]
-                        batch_y = batch_y[:, -self.args.output_token_len:, -1]
-                    else:
-                        outputs = outputs[:, :, -1]
-                        batch_y = batch_y[:, :, -1]
-
-                loss = criterion(outputs, batch_y)
-
-                # ==== MoE aux：平均 + 系数 + warmup（warmup 期不加） ====
-                moe_terms = []
-                for m in self.model.modules():
-                    if hasattr(m, "_moe_aux_total"):
-                        aux = m._moe_aux_total
-                        if not torch.is_tensor(aux):
-                            aux = torch.tensor(float(aux), device=self.device)
+                    # 原有 covariate 逻辑（可选）
+                    if self.args.covariate:
+                        if self.args.last_token:
+                            outputs = outputs[:, -self.args.output_token_len:, -1]
+                            batch_y = batch_y[:, -self.args.output_token_len:, -1]
                         else:
-                            aux = aux.to(self.device)
-                        if torch.isfinite(aux):
-                            moe_terms.append(aux)
-                if moe_terms:
-                    moe_aux = torch.stack(moe_terms).mean()  # 先对所有层取平均
-                    coef = getattr(self.args, "moe_aux_coef", 0.1)
-                    warm = getattr(self.args, "moe_warmup_epochs", 5)
-                    if epoch + 1 > warm:  # warmup 期间不加入 aux
-                        loss = loss + coef * moe_aux
-                # =====================================================
+                            outputs = outputs[:, :, -1]
+                            batch_y = batch_y[:, :, -1]
+
+                    loss = criterion(outputs, batch_y)
+
+                    # ==== MoE aux：平均 + 系数 + warmup（warmup 期不加） ====
+                    moe_terms = []
+                    for m in self.model.modules():
+                        if hasattr(m, "_moe_aux_total"):
+                            aux = m._moe_aux_total
+                            if not torch.is_tensor(aux):
+                                aux = torch.tensor(float(aux), device=self.device)
+                            else:
+                                aux = aux.to(self.device)
+                            if torch.isfinite(aux):
+                                moe_terms.append(aux)
+                    if moe_terms:
+                        moe_aux = torch.stack(moe_terms).mean()  # 先对所有层取平均
+                        coef = getattr(self.args, "moe_aux_coef", 0.1)
+                        warm = getattr(self.args, "moe_warmup_epochs", 5)
+                        if epoch + 1 > warm:  # warmup 期间不加入 aux
+                            loss = loss + coef * moe_aux
+                    # =====================================================
 
                 # ===== NaN/Inf 保护：发现非有限 loss 就跳过该步 =====
                 if not torch.isfinite(loss):
@@ -234,10 +245,12 @@ class Exp_Forecast(Exp_Basic):
                     model_optim.zero_grad()
                     continue
 
-                loss.backward()
-                # 梯度裁剪，稳定 MoE 路由训练
+                # === AMP：缩放反传 + 反缩放后裁剪 + step ===
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(model_optim)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                model_optim.step()
+                self.scaler.step(model_optim)
+                self.scaler.update()
 
             if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
                 print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
@@ -321,7 +334,9 @@ class Exp_Forecast(Exp_Basic):
                             seg = torch.cat([seg, seg[:, -1:, :].repeat(1, out_len - seg.size(1), 1)], dim=1)
                         batch_x_mark = torch.cat([batch_x_mark[:, out_len:, :], seg], dim=1)
 
-                    outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
+                    # AMP 推理
+                    with autocast(dtype=torch.float16):
+                        outputs = self.model(batch_x, batch_x_mark, batch_y_mark)
                     pred_segs.append(outputs[:, -out_len:, :])
 
                 # 拼接所有段，并裁成 test_pred_len

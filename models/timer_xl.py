@@ -129,11 +129,8 @@ class Model(nn.Module):
         else:
             self.adanorm = None
 
-        self.revin = RevIN(
-            num_features=getattr(configs, 'n_vars', None) if getattr(configs, 'revin', False) else None,
-            affine=getattr(configs, 'revin_affine', True),
-            eps=getattr(configs, 'revin_eps', 1e-5),
-        ) if getattr(configs, 'revin', False) and (not self.use_adanorm) else None
+        # ====== 禁用 Revin ======
+        self.revin = None  # 禁用 Revin
 
         # ====== UniCA ======
         self.use_unica = getattr(configs, 'use_unica', False)
@@ -205,6 +202,18 @@ class Model(nn.Module):
                     moe_imp_alpha=getattr(configs, 'moe_imp_alpha', 0.0),
                     moe_zloss_beta=getattr(configs, 'moe_zloss_beta', 0.0),
                     moe_entropy_reg=getattr(configs, 'moe_entropy_reg', 0.0),
+
+                    moe_mode=getattr(configs, 'moe_mode', 'vanilla'),             # 'vanilla' 或 'shared_routed_top2'
+                    moe_n_shared=getattr(configs, 'moe_n_shared', 0),             # 共享专家个数
+                    moe_r_shared=getattr(configs, 'moe_r_shared', 2),             # 共享专家扩展倍数 r_shared
+                    moe_r_routed=getattr(configs, 'moe_r_routed', 3),             # 路由专家扩展倍数 r_routed
+                    moe_router_tau=getattr(configs, 'moe_router_tau', 1.5),
+                    moe_router_noisy_std=getattr(configs, 'moe_router_noisy_std', 1.0),
+                    moe_dropless=getattr(configs, 'moe_dropless', False),
+
+                    # 方式B（兼容你先前命名）：只给这两个也行
+                    moe_shared_experts=getattr(configs, 'moe_shared_experts', None),  # e.g. 2
+                    moe_routed_experts=getattr(configs, 'moe_routed_experts', None),  # e.g. 10
                 )
                 for _ in range(configs.e_layers)
             ],
@@ -240,6 +249,9 @@ class Model(nn.Module):
             token_out_len=configs.output_token_len if self.head_type == 'tokenwise' else None,
             stride_equals_patch=(self.patch_stride == self.patch_len),
         )
+
+        if getattr(configs, 'use_moe', False):
+            self.convert_dense_ffn_to_moe()
 
     # ---------- 归一化 ----------
     def _pre_norm(self, x):

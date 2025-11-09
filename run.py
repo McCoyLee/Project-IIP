@@ -64,6 +64,7 @@ if __name__ == '__main__':
     parser.add_argument('--revin', action='store_true', default=False)
     parser.add_argument('--revin_affine', action='store_true', default=True)
     parser.add_argument('--revin_eps', type=float, default=1e-5)
+    parser.add_argument('--no_revin', action='store_true', default=False, help='disable Revin normalization')
 
     # ---- UniCA 开关 ----
     parser.add_argument('--use_unica', action='store_true', default=False,
@@ -76,7 +77,7 @@ if __name__ == '__main__':
     parser.add_argument('--unica_exclude_target', action='store_true', default=False,
                         help='exclude target channel statistics when building covariate features')
 
-    # ---- MoE ----
+    # ---- MoE（原有） ----
     parser.add_argument('--use_moe', action='store_true')
     parser.add_argument('--num_experts', type=int, default=8)
     parser.add_argument('--moe_init_noise', type=float, default=0.0)
@@ -91,6 +92,16 @@ if __name__ == '__main__':
     parser.add_argument('--moe_learnable_temp', action='store_true', default=False)
     parser.add_argument('--moe_gate_dropout', type=float, default=0.0)
     parser.add_argument('--moe_kl_alpha', type=float, default=0.0)
+
+    # ---- 新增：Shared+Routed Top-2 相关开关（保持向后兼容） ----
+    parser.add_argument('--moe_mode', type=str, default='vanilla',
+                        choices=['vanilla', 'shared_routed_top2'])
+    parser.add_argument('--moe_n_shared', type=int, default=1)
+    parser.add_argument('--moe_r_shared', type=int, default=2)
+    parser.add_argument('--moe_r_routed', type=int, default=3)
+    parser.add_argument('--moe_router_tau', type=float, default=1.5)
+    parser.add_argument('--moe_router_noisy_std', type=float, default=1.0)
+    parser.add_argument('--moe_dropless', action='store_true', default=False)
 
     # ---- AFS-Gate（新增）----
     parser.add_argument('--use_afs_gate', action='store_true', default=False,
@@ -171,6 +182,16 @@ if __name__ == '__main__':
     parser.add_argument('--weight_decay', type=float, default=0)
     parser.add_argument('--valid_last', action='store_true', help='valid last', default=False)
     parser.add_argument('--last_token', action='store_true', help='last token', default=False)
+
+    # ---- MoE 训练细节（你在 exp_forecast.py 中已引用，这里补齐默认） ----
+    parser.add_argument('--moe_warmup_epochs', type=int, default=5,
+                        help='enable experts at this epoch (warmup then switch to MoE)')
+    parser.add_argument('--moe_aux_coef', type=float, default=0.1,
+                        help='coefficient multiplied to per-layer _moe_aux_total')
+    parser.add_argument('--moe_shared_experts', type=int, default=None,
+                        help='Alias of moe_n_shared for shared+routed MoE.')
+    parser.add_argument('--moe_routed_experts', type=int, default=None,
+                    help='Alias of num_experts (routed experts) for shared+routed MoE.')
 
     # ---- GPU ----
     parser.add_argument('--gpu', type=int, default=0, help='gpu')

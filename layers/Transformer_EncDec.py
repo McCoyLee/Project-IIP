@@ -1,8 +1,17 @@
 # layers/Transformer_EncDec.py
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
-from layers.moe_ffn import MoEFeedForward  # 新增/已有
+
+from layers.moe_ffn import MoEFeedForward  # 现有 MoE（保留）
+
+# 可选导入：共享+路由 Top-2（已提供）
+try:
+    from layers.moe_shared_routed import SharedRoutedMoE  # 新增
+    _HAS_SHARED_ROUTED = True
+except Exception:
+    SharedRoutedMoE = None
+    _HAS_SHARED_ROUTED = False
 
 
 class EncoderLayer(nn.Module):
@@ -97,9 +106,19 @@ class TimerLayer(nn.Module):
                  moe_gate_temp: float = 1.0, moe_gate_noise_std: float = 0.0,
                  moe_lb_alpha: float = 0.0, moe_imp_alpha: float = 0.0,
                  moe_zloss_beta: float = 0.0, moe_entropy_reg: float = 0.0,
-                 moe_learnable_temp: bool = False,
-                 moe_gate_dropout: float = 0.0,
-                 moe_kl_alpha: float = 0.0):
+                 moe_learnable_temp: bool = False, moe_gate_dropout: float = 0.0,
+                 moe_kl_alpha: float = 0.0,
+                 # === 首选参数命名（shared+routed） ===
+                 moe_mode: str = 'vanilla',          # 'vanilla' or 'shared_routed_top2'
+                 moe_n_shared: int = 0,
+                 moe_r_shared: int = 2,
+                 moe_r_routed: int = 3,
+                 moe_router_tau: float = 1.5,
+                 moe_router_noisy_std: float = 1.0,
+                 moe_dropless: bool = False,
+                 # === 兼容你在 timer_xl.py 里可能已使用的命名 ===
+                 moe_shared_experts: int | None = None,
+                 moe_routed_experts: int | None = None):
         super(TimerLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
@@ -110,31 +129,76 @@ class TimerLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
-        # === MoE 配置 ===
+        # === MoE 基本配置 ===
         self.use_moe_flag = use_moe
         self.moe_init_noise = moe_init_noise
         self._is_moe_enabled = False
+
+        # 训练侧损失权重（shared+routed 需要）
+        self._lb_alpha = moe_lb_alpha
+        self._z_beta = moe_zloss_beta
+
+        # 统一映射参数（兼容两种命名）
+        self._moe_mode = moe_mode
+        # 兼容：若传入旧名则覆盖
+        if moe_shared_experts is not None:
+            moe_n_shared = int(moe_shared_experts)
+        routed_E = num_experts
+        if moe_routed_experts is not None:
+            routed_E = int(moe_routed_experts)
+
+        self._moe_n_shared = int(moe_n_shared)
+        self._moe_r_shared = int(moe_r_shared)
+        self._moe_r_routed = int(moe_r_routed)
+        self._moe_router_tau = float(moe_router_tau)
+        self._moe_router_noisy_std = float(moe_router_noisy_std)
+        self._moe_dropless = bool(moe_dropless)
+
+        # 构建 FFN / MoE
         if self.use_moe_flag:
-            self._moe = MoEFeedForward(
-                d_model=d_model, d_ff=d_ff, num_experts=num_experts,
-                dropout=dropout, activation=activation,
-                top_k=moe_topk, capacity_factor=moe_capacity_factor,
-                gate_temp=moe_gate_temp, gate_noise_std=moe_gate_noise_std,
-                lb_alpha=moe_lb_alpha, imp_alpha=moe_imp_alpha,
-                zloss_beta=moe_zloss_beta, entropy_reg=moe_entropy_reg,
-                learnable_gate_temp=moe_learnable_temp,
-                gate_dropout=moe_gate_dropout,
-                kl_alpha=moe_kl_alpha
-            )
+            use_shared_routed = (_HAS_SHARED_ROUTED and (
+                    self._moe_mode == 'shared_routed_top2' or self._moe_n_shared > 0
+            ))
+            if use_shared_routed:
+                # 共享 + 路由 Top-2
+                self._moe = SharedRoutedMoE(
+                    d_model=d_model,
+                    n_shared=self._moe_n_shared,
+                    n_routed=routed_E,
+                    r_shared=self._moe_r_shared,
+                    r_routed=self._moe_r_routed,
+                    expert_dropout=dropout,
+                    router_noisy_std=self._moe_router_noisy_std,
+                    router_tau=self._moe_router_tau,
+                    capacity_factor=None if self._moe_dropless else moe_capacity_factor,
+                    use_dropless=self._moe_dropless,
+                )
+            else:
+                # 回退 vanilla MoE
+                self._moe = MoEFeedForward(
+                    d_model=d_model, d_ff=d_ff, num_experts=routed_E,
+                    dropout=dropout, activation=activation,
+                    top_k=moe_topk, capacity_factor=moe_capacity_factor,
+                    gate_temp=moe_gate_temp, gate_noise_std=moe_gate_noise_std,
+                    lb_alpha=moe_lb_alpha, imp_alpha=moe_imp_alpha,
+                    zloss_beta=moe_zloss_beta, entropy_reg=moe_entropy_reg,
+                    learnable_gate_temp=moe_learnable_temp,
+                    gate_dropout=moe_gate_dropout,
+                    kl_alpha=moe_kl_alpha
+                )
         else:
             self._moe = None
+
+        # 训练侧 aux 聚合
         self.register_buffer("_moe_aux_total", torch.tensor(0.0))
 
     @torch.no_grad()
     def enable_moe(self):
+        """在训练开始前由外部调用，用 dense conv1/conv2 权重初始化 MoE（如实现）。"""
         if self._moe is None or self._is_moe_enabled:
             return
-        self._moe.init_from_conv1x1(self.conv1, self.conv2, noise_std=self.moe_init_noise)
+        if hasattr(self._moe, "init_from_conv1x1"):
+            self._moe.init_from_conv1x1(self.conv1, self.conv2, noise_std=self.moe_init_noise)
         self._is_moe_enabled = True
 
     def _dense_ffn(self, y: torch.Tensor) -> torch.Tensor:
@@ -144,13 +208,37 @@ class TimerLayer(nn.Module):
         return y
 
     def _moe_ffn(self, y: torch.Tensor) -> torch.Tensor:
-        y = self._moe(y)
-        aux = self._moe._last_aux["total"]
-        if isinstance(aux, torch.Tensor):
-            self._moe_aux_total.copy_(aux.detach())
+        out = self._moe(y)
+        # 两种形式：
+        # (A) vanilla: 返回 y，并在 self._moe._last_aux['total'] 提供标量
+        # (B) shared_routed: 返回 (y, aux)，需要我们计算 total
+        if isinstance(out, tuple):
+            y_out, aux = out
+            total = 0.0
+            if self._lb_alpha > 0 and isinstance(aux, dict) and ('f_i' in aux) and ('p_i' in aux):
+                f_i = aux['f_i']; p_i = aux['p_i']
+                if torch.is_tensor(f_i) and torch.is_tensor(p_i):
+                    n = f_i.numel()
+                    total = total + self._lb_alpha * n * torch.sum(f_i * p_i)
+            if self._z_beta > 0 and isinstance(aux, dict) and ('router_logits' in aux):
+                z = torch.logsumexp(aux['router_logits'], dim=-1)
+                total = total + self._z_beta * torch.mean(z ** 2)
+
+            if not torch.is_tensor(total):
+                total = torch.tensor(float(total), device=self._moe_aux_total.device)
+            self._moe_aux_total.copy_(total.detach())
+            return y_out
         else:
-            self._moe_aux_total.copy_(torch.tensor(float(aux), device=self._moe_aux_total.device))
-        return y
+            y_out = out
+            aux = getattr(self._moe, "_last_aux", None)
+            if isinstance(aux, dict) and "total" in aux:
+                val = aux["total"]
+                if not torch.is_tensor(val):
+                    val = torch.tensor(float(val), device=self._moe_aux_total.device)
+                self._moe_aux_total.copy_(val.detach())
+            else:
+                self._moe_aux_total.zero_()
+            return y_out
 
     def forward(self, x, n_vars, n_tokens, attn_mask=None, tau=None, delta=None, extra_ctx=None):
         new_x, attn = self.attention(
