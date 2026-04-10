@@ -29,6 +29,15 @@ class MoEFeedForward(nn.Module):
     - 强力数值防护：softmax 前后、正则与输出均做 NaN/Inf 清理
     - _last_aux：{'balance_switch','balance_kl','importance','assigned_frac','entropy','zloss','total'}
     * 与旧版保持兼容：不传新增参数时行为与原实现一致
+
+    ---------- FIR-MoE 扩展（本论文核心贡献）----------
+    - use_fir: 是否启用频率引导路由。启用后路由器输入为 [h_token; f_band]
+    - fir_freq_dim (K): 频带数（需在 forward 时通过 freq_features 传入 [T, K]）
+    - fir_spec_alpha: 专家频率特化正则权重。正则形式为:
+        L_spec = -mean( KL(P_e || uniform_K) )    (越大→每个专家频率分布越偏离均匀→越特化)
+      其中 P_e ∈ R^K 是专家 e 被分配到的 token 的频率分布平均值。
+      实现上我们直接最大化 P_e 的熵的负值（即最小化 -Σ KL）。
+    - fir_ortho_alpha: (可选) 专家频率分布之间的正交正则 ||P^T P - I||_F
     """
 
     def __init__(
@@ -51,6 +60,11 @@ class MoEFeedForward(nn.Module):
             learnable_gate_temp: bool = False,
             gate_dropout: float = 0.0,   # [0,1)
             kl_alpha: float = 0.0,       # KL(uniform||load) 权重
+            # === FIR-MoE 新增 ===
+            use_fir: bool = False,
+            fir_freq_dim: int = 0,           # K
+            fir_spec_alpha: float = 0.0,     # 频率特化正则权重
+            fir_ortho_alpha: float = 0.0,    # 专家正交正则权重（可选）
     ):
         super().__init__()
         assert top_k in (1, 2)
@@ -67,10 +81,18 @@ class MoEFeedForward(nn.Module):
         self.gate_dropout = gate_dropout
         self.kl_alpha = kl_alpha
 
+        # FIR-MoE
+        self.use_fir = bool(use_fir)
+        self.fir_freq_dim = int(fir_freq_dim) if self.use_fir else 0
+        self.fir_spec_alpha = float(fir_spec_alpha)
+        self.fir_ortho_alpha = float(fir_ortho_alpha)
+
         self.experts = nn.ModuleList(
             [ExpertFFN(d_model, d_ff, dropout, activation) for _ in range(num_experts)]
         )
-        self.gate = nn.Linear(d_model, num_experts)
+        # 路由器输入维度：FIR 下扩展为 d_model + K
+        gate_in_dim = d_model + self.fir_freq_dim if self.use_fir else d_model
+        self.gate = nn.Linear(gate_in_dim, num_experts)
         # 路由器零初始化：均匀起步更稳
         nn.init.zeros_(self.gate.weight)
         nn.init.zeros_(self.gate.bias)
@@ -91,8 +113,19 @@ class MoEFeedForward(nn.Module):
             "assigned_frac": torch.tensor(0.0),
             "zloss": torch.tensor(0.0),
             "entropy": torch.tensor(0.0),
+            "fir_spec": torch.tensor(0.0),
+            "fir_ortho": torch.tensor(0.0),
             "total": torch.tensor(0.0),
         }
+        # 用于可视化分析：最新一次前向的专家频率签名 [E, K]
+        if self.use_fir and self.fir_freq_dim > 0:
+            self.register_buffer(
+                "_expert_freq_profile",
+                torch.zeros(num_experts, self.fir_freq_dim),
+                persistent=False,
+            )
+        else:
+            self._expert_freq_profile = None
 
     @torch.no_grad()
     def init_from_conv1x1(self, conv1, conv2, noise_std: float = 0.0):
@@ -124,12 +157,30 @@ class MoEFeedForward(nn.Module):
             return torch.clamp(temp, min=self._min_temp)
         return torch.tensor(max(self._min_temp, self.base_gate_temp), device=device)
 
-    def _routing(self, h: torch.Tensor, training: bool):
+    def _routing(self, h: torch.Tensor, training: bool, freq_feat: torch.Tensor = None):
+        """
+        h: [B, L, D]
+        freq_feat: [B, L, K] (optional, required when use_fir=True)
+        """
         B, L, D = h.shape
         T = B * L
         x = h.reshape(T, D)
 
-        logits = self.gate(x)  # [T, E]
+        # FIR: 将频率特征拼接到路由器输入
+        if self.use_fir and self.fir_freq_dim > 0:
+            if freq_feat is None:
+                # 缺失时退化：用零向量（等价于纯隐藏状态路由）
+                f_flat = x.new_zeros(T, self.fir_freq_dim)
+            else:
+                assert freq_feat.shape[-1] == self.fir_freq_dim, \
+                    f"freq_feat dim {freq_feat.shape[-1]} != K {self.fir_freq_dim}"
+                f_flat = freq_feat.reshape(T, self.fir_freq_dim).to(x.dtype)
+            gate_in = torch.cat([x, f_flat], dim=-1)       # [T, D+K]
+        else:
+            f_flat = None
+            gate_in = x
+
+        logits = self.gate(gate_in)  # [T, E]
         logits = torch.nan_to_num(logits, neginf=-1e4, posinf=1e4)
 
         # 训练期扰动
@@ -185,21 +236,62 @@ class MoEFeedForward(nn.Module):
         # importance（平方和）按 E 缩放，方便不同 E 可比
         imp = (importance * importance).sum() * self.num_experts
 
+        # === FIR-MoE 频率特化正则 ===
+        fir_spec = torch.tensor(0.0, device=logits.device)
+        fir_ortho = torch.tensor(0.0, device=logits.device)
+        if self.use_fir and (f_flat is not None) and (self.fir_spec_alpha > 0 or self.fir_ortho_alpha > 0):
+            # P[e, k] = Σ_t (probs[t, e] * f_flat[t, k]) / Σ_t probs[t, e]
+            # 使用软分配而非 one-hot，使梯度可流回 router 和 freq 通路
+            denom = probs.sum(dim=0).clamp_min(1e-9)            # [E]
+            P = torch.einsum('te,tk->ek', probs, f_flat) / denom.unsqueeze(-1)  # [E, K]
+            # 行归一化成分布（应当已经接近分布，因为 f_flat 已归一）
+            P = P / (P.sum(dim=-1, keepdim=True) + 1e-9)
+
+            if self.fir_spec_alpha > 0:
+                # 最大化每个专家频率分布与均匀分布的 KL 散度 → 鼓励特化
+                K = P.shape[-1]
+                uniform = torch.full_like(P, 1.0 / K)
+                kl = (P * (P.clamp_min(1e-9).log() - uniform.log())).sum(dim=-1)  # [E]
+                # 损失：-mean(KL) (越小→KL越大→越特化)
+                fir_spec = -kl.mean()
+
+            if self.fir_ortho_alpha > 0:
+                # 专家频率分布的 Gram 矩阵应该接近对角阵 → 专家在频域相互正交
+                PtP = P @ P.transpose(0, 1)                     # [E, E]
+                I = torch.eye(P.shape[0], device=P.device, dtype=P.dtype)
+                fir_ortho = ((PtP - I) ** 2).mean()
+
+            # 缓存供可视化
+            if self._expert_freq_profile is not None:
+                self._expert_freq_profile.copy_(P.detach())
+
+        fir_spec = torch.nan_to_num(fir_spec, nan=0.0, posinf=0.0, neginf=0.0)
+        fir_ortho = torch.nan_to_num(fir_ortho, nan=0.0, posinf=0.0, neginf=0.0)
+
         self._last_aux.update({
             "balance_switch": balance_switch.detach(),
             "balance_kl": balance_kl.detach(),
             "importance": imp.detach(),
             "zloss": zloss.detach(),
             "entropy": ent.detach(),
+            "fir_spec": fir_spec.detach(),
+            "fir_ortho": fir_ortho.detach(),
         })
+        # 保留可微的 fir 正则以便 forward 里组装到 total
+        self._last_aux["_fir_spec_live"] = fir_spec
+        self._last_aux["_fir_ortho_live"] = fir_ortho
 
         return topk_idx, topk_prob, probs
 
-    def forward(self, h: torch.Tensor):
+    def forward(self, h: torch.Tensor, freq_features: torch.Tensor = None):
+        """
+        h: [B, L, D] — token embeddings
+        freq_features: [B, L, K] — per-token frequency band distribution (FIR-MoE)
+        """
         B, L, D = h.shape
         T = B * L
 
-        topk_idx, topk_prob, _ = self._routing(h, self.training)
+        topk_idx, topk_prob, _ = self._routing(h, self.training, freq_feat=freq_features)
 
         # 每个 expert 的容量
         capacity = math.ceil(self.capacity_factor * (T * self.top_k / self.num_experts))
@@ -269,21 +361,40 @@ class MoEFeedForward(nn.Module):
         y = out.reshape(B, L, D)
         y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # 组装 aux 正则
-        total = 0.0
+        # 组装 aux 正则（对 detached 指标保持不变，同时保留可微总损失）
+        device = y.device
+        total_scalar = 0.0       # 供 _last_aux["total"] 记录（float 标量）
+        total_live = torch.tensor(0.0, device=device)   # 可微张量，反向传播使用
         if self.training:
             if self.lb_alpha > 0:
-                total += self.lb_alpha * self._last_aux["balance_switch"]
+                total_scalar += float(self.lb_alpha * self._last_aux["balance_switch"].item())
+                total_live = total_live + self.lb_alpha * self._last_aux["balance_switch"]
             if self.imp_alpha > 0:
-                total += self.imp_alpha * self._last_aux["importance"]
+                total_scalar += float(self.imp_alpha * self._last_aux["importance"].item())
+                total_live = total_live + self.imp_alpha * self._last_aux["importance"]
             if self.kl_alpha > 0:
-                total += self.kl_alpha * self._last_aux["balance_kl"]
+                total_scalar += float(self.kl_alpha * self._last_aux["balance_kl"].item())
+                total_live = total_live + self.kl_alpha * self._last_aux["balance_kl"]
             if self.zloss_beta > 0:
-                total += self.zloss_beta * self._last_aux["zloss"]
+                total_scalar += float(self.zloss_beta * self._last_aux["zloss"].item())
+                total_live = total_live + self.zloss_beta * self._last_aux["zloss"]
             if self.entropy_reg > 0:
-                total += self.entropy_reg * self._last_aux["entropy"]
+                total_scalar += float(self.entropy_reg * self._last_aux["entropy"].item())
+                total_live = total_live + self.entropy_reg * self._last_aux["entropy"]
+            # === FIR-MoE 正则（可微）===
+            if self.use_fir and self.fir_spec_alpha > 0 and "_fir_spec_live" in self._last_aux:
+                live = self._last_aux["_fir_spec_live"]
+                if torch.is_tensor(live):
+                    total_scalar += float(self.fir_spec_alpha * live.detach().item())
+                    total_live = total_live + self.fir_spec_alpha * live
+            if self.use_fir and self.fir_ortho_alpha > 0 and "_fir_ortho_live" in self._last_aux:
+                live = self._last_aux["_fir_ortho_live"]
+                if torch.is_tensor(live):
+                    total_scalar += float(self.fir_ortho_alpha * live.detach().item())
+                    total_live = total_live + self.fir_ortho_alpha * live
 
-        self._last_aux["total"] = torch.tensor(float(total), device=y.device)
-        self._last_aux["assigned_frac"] = torch.tensor(assigned / float(T), device=y.device)
+        self._last_aux["total"] = torch.tensor(float(total_scalar), device=device)
+        self._last_aux["total_live"] = total_live
+        self._last_aux["assigned_frac"] = torch.tensor(assigned / float(T), device=device)
 
         return y

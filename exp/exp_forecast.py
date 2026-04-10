@@ -219,19 +219,31 @@ class Exp_Forecast(Exp_Basic):
 
                     loss = criterion(outputs, batch_y)
 
-                    # ==== MoE aux：平均 + 系数 + warmup（warmup 期不加） ====
-                    moe_terms = []
-                    for m in self.model.modules():
-                        if hasattr(m, "_moe_aux_total"):
-                            aux = m._moe_aux_total
-                            if not torch.is_tensor(aux):
-                                aux = torch.tensor(float(aux), device=self.device)
-                            else:
-                                aux = aux.to(self.device)
-                            if torch.isfinite(aux):
-                                moe_terms.append(aux)
-                    if moe_terms:
-                        moe_aux = torch.stack(moe_terms).mean()  # 先对所有层取平均
+                    # ==== MoE aux：使用 model.moe_aux_loss() 读取 total_live 以保留梯度 ====
+                    # 说明：旧实现走 _moe_aux_total buffer（detached），会丢失 FIR-MoE 频率
+                    # 特化正则等可微分项的梯度；新实现优先调用 model.moe_aux_loss()。
+                    core_model = self.model.module if hasattr(self.model, "module") else self.model
+                    moe_aux = None
+                    if hasattr(core_model, "moe_aux_loss"):
+                        try:
+                            moe_aux = core_model.moe_aux_loss()
+                        except Exception:
+                            moe_aux = None
+                    if moe_aux is None:
+                        # 回退到旧路径（兼容没有 moe_aux_loss 的情形）
+                        moe_terms = []
+                        for m in self.model.modules():
+                            if hasattr(m, "_moe_aux_total"):
+                                aux = m._moe_aux_total
+                                if not torch.is_tensor(aux):
+                                    aux = torch.tensor(float(aux), device=self.device)
+                                else:
+                                    aux = aux.to(self.device)
+                                if torch.isfinite(aux):
+                                    moe_terms.append(aux)
+                        if moe_terms:
+                            moe_aux = torch.stack(moe_terms).mean()
+                    if moe_aux is not None and torch.isfinite(moe_aux):
                         coef = getattr(self.args, "moe_aux_coef", 0.1)
                         warm = getattr(self.args, "moe_warmup_epochs", 5)
                         if epoch + 1 > warm:  # warmup 期间不加入 aux
