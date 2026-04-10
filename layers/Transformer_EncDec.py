@@ -118,7 +118,12 @@ class TimerLayer(nn.Module):
                  moe_dropless: bool = False,
                  # === 兼容你在 timer_xl.py 里可能已使用的命名 ===
                  moe_shared_experts: int | None = None,
-                 moe_routed_experts: int | None = None):
+                 moe_routed_experts: int | None = None,
+                 # === FIR-MoE 新增 ===
+                 use_fir_moe: bool = False,
+                 fir_freq_dim: int = 0,
+                 fir_spec_alpha: float = 0.0,
+                 fir_ortho_alpha: float = 0.0):
         super(TimerLayer, self).__init__()
         d_ff = d_ff or 4 * d_model
         self.attention = attention
@@ -154,6 +159,12 @@ class TimerLayer(nn.Module):
         self._moe_router_noisy_std = float(moe_router_noisy_std)
         self._moe_dropless = bool(moe_dropless)
 
+        # FIR-MoE 配置
+        self._use_fir_moe = bool(use_fir_moe)
+        self._fir_freq_dim = int(fir_freq_dim)
+        self._fir_spec_alpha = float(fir_spec_alpha)
+        self._fir_ortho_alpha = float(fir_ortho_alpha)
+
         # 构建 FFN / MoE
         if self.use_moe_flag:
             use_shared_routed = (_HAS_SHARED_ROUTED and (
@@ -174,7 +185,7 @@ class TimerLayer(nn.Module):
                     use_dropless=self._moe_dropless,
                 )
             else:
-                # 回退 vanilla MoE
+                # 回退 vanilla MoE（支持 FIR-MoE 扩展）
                 self._moe = MoEFeedForward(
                     d_model=d_model, d_ff=d_ff, num_experts=routed_E,
                     dropout=dropout, activation=activation,
@@ -184,7 +195,12 @@ class TimerLayer(nn.Module):
                     zloss_beta=moe_zloss_beta, entropy_reg=moe_entropy_reg,
                     learnable_gate_temp=moe_learnable_temp,
                     gate_dropout=moe_gate_dropout,
-                    kl_alpha=moe_kl_alpha
+                    kl_alpha=moe_kl_alpha,
+                    # FIR-MoE
+                    use_fir=self._use_fir_moe,
+                    fir_freq_dim=self._fir_freq_dim,
+                    fir_spec_alpha=self._fir_spec_alpha,
+                    fir_ortho_alpha=self._fir_ortho_alpha,
                 )
         else:
             self._moe = None
@@ -207,8 +223,12 @@ class TimerLayer(nn.Module):
         self._moe_aux_total.zero_()
         return y
 
-    def _moe_ffn(self, y: torch.Tensor) -> torch.Tensor:
-        out = self._moe(y)
+    def _moe_ffn(self, y: torch.Tensor, freq_features: torch.Tensor = None) -> torch.Tensor:
+        # 对于支持 FIR 的 vanilla MoE，透传 freq_features；其他变体忽略该参数
+        if self._use_fir_moe and isinstance(self._moe, MoEFeedForward):
+            out = self._moe(y, freq_features=freq_features)
+        else:
+            out = self._moe(y)
         # 两种形式：
         # (A) vanilla: 返回 y，并在 self._moe._last_aux['total'] 提供标量
         # (B) shared_routed: 返回 (y, aux)，需要我们计算 total
@@ -251,7 +271,11 @@ class TimerLayer(nn.Module):
 
         y = self.norm1(x)
         if getattr(self, "_is_moe_enabled", False):
-            y = self._moe_ffn(y)
+            # 从 extra_ctx 中提取 FIR 频率特征（若存在）
+            freq_feat = None
+            if isinstance(extra_ctx, dict) and extra_ctx is not None:
+                freq_feat = extra_ctx.get("freq_features", None)
+            y = self._moe_ffn(y, freq_features=freq_feat)
         else:
             y = self._dense_ffn(y)
 

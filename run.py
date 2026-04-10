@@ -118,6 +118,24 @@ if __name__ == '__main__':
     parser.add_argument('--afs_as_moe_prior', action='store_true', default=False,
                         help='expose AFS alpha as MoE prior (requires gate support)')
 
+    # ---- FIR-MoE (Frequency-Informed MoE Routing) ----
+    parser.add_argument('--use_fir_moe', action='store_true', default=False,
+                        help='enable frequency-informed MoE routing (concat freq features to router input)')
+    parser.add_argument('--fir_bands', type=int, default=8,
+                        help='number of frequency bands K for FIR-MoE router features')
+    parser.add_argument('--fir_spec_alpha', type=float, default=0.01,
+                        help='weight of expert frequency specialization loss (max KL from uniform)')
+    parser.add_argument('--fir_ortho_alpha', type=float, default=0.0,
+                        help='weight of expert frequency orthogonality loss (||P^T P - I||_F)')
+
+    # ---- TAN (Token-Adaptive Normalization) ----
+    parser.add_argument('--use_tan', action='store_true', default=False,
+                        help='enable token-adaptive normalization (per-patch local stats + freq-conditioned mixing)')
+    parser.add_argument('--tan_freq_cond', action='store_true', default=True,
+                        help='use freq features to drive TAN mixing coefficient alpha/beta')
+    parser.add_argument('--tan_bands', type=int, default=8,
+                        help='number of frequency bands K for TAN freq conditioning')
+
     # ---- basic config ----
     parser.add_argument('--task_name', type=str, required=True, default='forecast', help='task name, options:[forecast]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
