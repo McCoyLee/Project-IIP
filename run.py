@@ -133,6 +133,8 @@ if __name__ == '__main__':
                         help='enable token-adaptive normalization (per-patch local stats + freq-conditioned mixing)')
     parser.add_argument('--tan_freq_cond', action='store_true', default=True,
                         help='use freq features to drive TAN mixing coefficient alpha/beta')
+    parser.add_argument('--tan_no_freq_cond', action='store_true', default=False,
+                        help='ablation: disable freq conditioning in TAN (fall back to fixed alpha/beta)')
     parser.add_argument('--tan_bands', type=int, default=8,
                         help='number of frequency bands K for TAN freq conditioning')
 

@@ -181,7 +181,11 @@ class Model(nn.Module):
 
         # ====== TAN（补充贡献：Token 级自适应归一化）======
         self.use_tan = getattr(configs, 'use_tan', False)
-        self.tan_freq_cond = getattr(configs, 'tan_freq_cond', True)
+        # 支持 --tan_no_freq_cond 显式关闭频率条件门控
+        self.tan_freq_cond = (
+            getattr(configs, 'tan_freq_cond', True)
+            and not getattr(configs, 'tan_no_freq_cond', False)
+        )
         self.tan_bands = int(getattr(configs, 'tan_bands', 8))
 
         # FIR-MoE 和 TAN 共享的 per-token 频率提取器（若任一启用则构建）
