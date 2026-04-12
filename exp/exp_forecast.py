@@ -139,7 +139,10 @@ class Exp_Forecast(Exp_Basic):
         if self.args.ddp:
             total_loss = torch.tensor(np.average(total_loss, weights=total_count)).to(self.device)
             dist.barrier()
-            dist.reduce(total_loss, dst=0, op=dist.ReduceOp.SUM)
+            # all_reduce so EVERY rank gets the same global loss —
+            # dist.reduce(dst=0) only updates rank 0, causing ranks to
+            # diverge on early-stopping decisions → NCCL timeout.
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             total_loss = total_loss.item() / dist.get_world_size()
         else:
             total_loss = np.average(total_loss, weights=total_count)
