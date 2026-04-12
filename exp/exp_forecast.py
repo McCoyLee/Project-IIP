@@ -39,7 +39,8 @@ class Exp_Forecast(Exp_Basic):
         model = self.model_dict[self.args.model].Model(self.args)
 
         if self.args.ddp:
-            model = DDP(model.cuda(), device_ids=[self.args.local_rank])
+            model = DDP(model.cuda(), device_ids=[self.args.local_rank],
+                        find_unused_parameters=True)
         elif self.args.dp:
             model = DataParallel(model, device_ids=self.args.device_ids).to(self.device)
         else:

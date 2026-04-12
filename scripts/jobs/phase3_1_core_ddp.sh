@@ -18,7 +18,7 @@
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True,max_split_size_mb=128,garbage_collection_threshold:0.8'
+export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8'
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 # 禁用 tokenizers/并行库的线程警告
