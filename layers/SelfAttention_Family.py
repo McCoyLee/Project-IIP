@@ -108,7 +108,8 @@ class TimeAttention(nn.Module):
             logits = scale * scores + attn_mask
             if getattr(self, 'desta', None) is not None and extra_ctx is not None and ('stats' in extra_ctx):
                 logits = self.desta(logits, extra_ctx['stats'])
-            A = self.dropout(torch.softmax(logits, dim=-1))
+            # 显式 float32 softmax：V100 float16 下 softmax 对含 -inf 的 mask 有数值问题
+            A = self.dropout(torch.softmax(logits.float(), dim=-1).to(logits.dtype))
             V = torch.einsum("bhls,bshd->blhd", A, values)
 
         if self.output_attention:
