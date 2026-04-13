@@ -90,6 +90,7 @@ COMMON_ARGS=(
     --cosine
     --tmax 50
     --n_vars 321
+    --ci_backbone
     --patch_size 0
     --stride 0
     --eval_target_only
