@@ -254,10 +254,23 @@ class Exp_Forecast(Exp_Basic):
                             loss = loss + coef * moe_aux
                     # =====================================================
 
-                # ===== NaN/Inf 保护：发现非有限 loss 就跳过该步 =====
-                if not torch.isfinite(loss):
+                # ===== NaN/Inf 保护 =====
+                # DDP 要求所有 rank 在每个 step 执行相同的 backward + collective，
+                # 不能由某些 rank continue 跳过 backward 而其他 rank 继续。
+                # 因此：若任意 rank 出现 NaN → 所有 rank 统一跳过。
+                if self.args.ddp:
+                    is_bad = torch.tensor(
+                        [0.0 if torch.isfinite(loss) else 1.0],
+                        device=self.device,
+                    )
+                    dist.all_reduce(is_bad, op=dist.ReduceOp.MAX)
+                    skip_step = is_bad.item() > 0.5
+                else:
+                    skip_step = not torch.isfinite(loss)
+
+                if skip_step:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
-                        print("[warn] non-finite loss detected (NaN/Inf). Skip step.")
+                        print("[warn] non-finite loss on some rank. All ranks skip step.")
                     model_optim.zero_grad()
                     continue
 
