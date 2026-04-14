@@ -309,7 +309,11 @@ if __name__ == '__main__':
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            if not args.ddp and not args.dp:
+            if args.ddp:
+                # DDP 模式：只在 rank 0 上跑测试（模型已在 train() 末尾 load 最优 ckpt）
+                if args.local_rank == 0:
+                    exp.test(setting)
+            elif not args.dp:
                 exp.test(setting)
             torch.cuda.empty_cache()
     else:
