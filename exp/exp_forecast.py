@@ -39,7 +39,8 @@ class Exp_Forecast(Exp_Basic):
         model = self.model_dict[self.args.model].Model(self.args)
 
         if self.args.ddp:
-            model = DDP(model.cuda(), device_ids=[self.args.local_rank])
+            model = DDP(model.cuda(), device_ids=[self.args.local_rank],
+                        find_unused_parameters=True)
         elif self.args.dp:
             model = DataParallel(model, device_ids=self.args.device_ids).to(self.device)
         else:
@@ -139,7 +140,10 @@ class Exp_Forecast(Exp_Basic):
         if self.args.ddp:
             total_loss = torch.tensor(np.average(total_loss, weights=total_count)).to(self.device)
             dist.barrier()
-            dist.reduce(total_loss, dst=0, op=dist.ReduceOp.SUM)
+            # all_reduce so EVERY rank gets the same global loss —
+            # dist.reduce(dst=0) only updates rank 0, causing ranks to
+            # diverge on early-stopping decisions → NCCL timeout.
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
             total_loss = total_loss.item() / dist.get_world_size()
         else:
             total_loss = np.average(total_loss, weights=total_count)
@@ -250,10 +254,23 @@ class Exp_Forecast(Exp_Basic):
                             loss = loss + coef * moe_aux
                     # =====================================================
 
-                # ===== NaN/Inf 保护：发现非有限 loss 就跳过该步 =====
-                if not torch.isfinite(loss):
+                # ===== NaN/Inf 保护 =====
+                # DDP 要求所有 rank 在每个 step 执行相同的 backward + collective，
+                # 不能由某些 rank continue 跳过 backward 而其他 rank 继续。
+                # 因此：若任意 rank 出现 NaN → 所有 rank 统一跳过。
+                if self.args.ddp:
+                    is_bad = torch.tensor(
+                        [0.0 if torch.isfinite(loss) else 1.0],
+                        device=self.device,
+                    )
+                    dist.all_reduce(is_bad, op=dist.ReduceOp.MAX)
+                    skip_step = is_bad.item() > 0.5
+                else:
+                    skip_step = not torch.isfinite(loss)
+
+                if skip_step:
                     if (self.args.ddp and self.args.local_rank == 0) or not self.args.ddp:
-                        print("[warn] non-finite loss detected (NaN/Inf). Skip step.")
+                        print("[warn] non-finite loss on some rank. All ranks skip step.")
                     model_optim.zero_grad()
                     continue
 

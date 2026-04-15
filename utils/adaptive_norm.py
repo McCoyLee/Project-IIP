@@ -166,6 +166,7 @@ class TokenAdaptiveNorm(nn.Module):
             use_freq_cond: bool = True,
             alpha_init_bias: float = 0.0,    # sigmoid(0) = 0.5
             affine: bool = True,
+            std_floor: float = 1e-2,
     ):
         super().__init__()
         self.n_vars = n_vars
@@ -173,6 +174,8 @@ class TokenAdaptiveNorm(nn.Module):
         self.stride = stride
         self.freq_dim = int(freq_dim)
         self.eps = eps
+        # std_floor：防止 fp16 下 1/std 溢出（数据已 StandardScaled 时，std~1，0.01 是合理下限）
+        self.std_floor = float(std_floor)
         self.use_freq_cond = bool(use_freq_cond) and self.freq_dim > 0
         self.affine = affine
 
@@ -208,23 +211,25 @@ class TokenAdaptiveNorm(nn.Module):
         self._cache = {}
 
     @staticmethod
-    def _global_stats(x: torch.Tensor, eps: float):
-        # x: [B, L, C]
-        mean = x.mean(dim=1, keepdim=True)                              # [B,1,C]
-        std = x.std(dim=1, unbiased=False, keepdim=True).clamp_min(eps) # [B,1,C]
+    def _global_stats(x: torch.Tensor, std_floor: float):
+        # x: [B, L, C]；用 std_floor 限制下限以避免 fp16 下的 1/std 溢出
+        x_f = x.float()
+        mean = x_f.mean(dim=1, keepdim=True)                              # [B,1,C]
+        std = x_f.std(dim=1, unbiased=False, keepdim=True).clamp_min(std_floor)
         return mean, std
 
     @staticmethod
-    def _local_stats(x: torch.Tensor, patch_len: int, stride: int, n_tokens: int, eps: float):
+    def _local_stats(x: torch.Tensor, patch_len: int, stride: int, n_tokens: int, std_floor: float):
         """
         x: [B, L, C]
         Returns:
             mu_local  : [B, C, N]
             std_local : [B, C, N]
+        全程 float32 计算，避免 fp16 下 var→0 时 sqrt 再 clamp 失败。
         """
         B, L, C = x.shape
         P, S = int(patch_len), int(stride)
-        x_bc = x.permute(0, 2, 1).contiguous()                          # [B, C, L]
+        x_bc = x.float().permute(0, 2, 1).contiguous()                  # [B, C, L]
         if x_bc.shape[-1] < P:
             x_bc = F.pad(x_bc, (0, P - x_bc.shape[-1]), mode='replicate')
         patches = x_bc.unfold(dimension=-1, size=P, step=S)             # [B, C, N', P]
@@ -235,8 +240,8 @@ class TokenAdaptiveNorm(nn.Module):
         elif Np > n_tokens:
             patches = patches[:, :, :n_tokens, :]
         mu = patches.mean(dim=-1)                                       # [B,C,N]
-        var = patches.var(dim=-1, unbiased=False).clamp_min(eps * eps)
-        std = torch.sqrt(var)                                           # [B,C,N]
+        var = patches.var(dim=-1, unbiased=False)
+        std = torch.sqrt(var).clamp_min(std_floor)                      # [B,C,N]，下限避免 fp16 溢出
         return mu, std
 
     def forward_in(self, x: torch.Tensor, freq_features: torch.Tensor, n_tokens: int):
@@ -252,11 +257,11 @@ class TokenAdaptiveNorm(nn.Module):
         B, L, C = x.shape
         N = int(n_tokens)
 
-        # Global stats
-        mu_g, std_g = self._global_stats(x, self.eps)                  # [B,1,C]
+        # Global stats（float32，下限 std_floor）
+        mu_g, std_g = self._global_stats(x, self.std_floor)             # [B,1,C]
 
-        # Local per-patch stats
-        mu_l, std_l = self._local_stats(x, self.patch_len, self.stride, N, self.eps)  # [B,C,N]
+        # Local per-patch stats（float32，下限 std_floor）
+        mu_l, std_l = self._local_stats(x, self.patch_len, self.stride, N, self.std_floor)  # [B,C,N]
 
         # 将 per-patch 统计扩展回 per-timestep 统计，沿 [B, L, C]
         # 简化：对 token i 的局部 stat 广播到该 token 覆盖的时间段（优先对每个时间步用"最近 token"的统计）
@@ -288,10 +293,16 @@ class TokenAdaptiveNorm(nn.Module):
             alpha_t = torch.sigmoid(self.alpha).expand(B, L, C)
             beta_t = torch.sigmoid(self.beta).expand(B, L, C)
 
-        # 混合归一化
-        x_norm_local = (x - mu_l_t) / std_l_t
-        x_norm_global = (x - mu_g) / std_g
-        x_norm = alpha_t * x_norm_local + (1.0 - alpha_t) * x_norm_global
+        # 混合归一化（在 float32 下做除法以避免 fp16 溢出）
+        x_f = x.float()
+        x_norm_local = (x_f - mu_l_t.float()) / std_l_t.float().clamp_min(self.std_floor)
+        x_norm_global = (x_f - mu_g.float()) / std_g.float().clamp_min(self.std_floor)
+        # 防御性裁剪：极端样本 (如常数段) 可能仍接近下限，直接截断到合理范围
+        x_norm_local = x_norm_local.clamp(-30.0, 30.0)
+        x_norm_global = x_norm_global.clamp(-30.0, 30.0)
+        a32 = alpha_t.float()
+        x_norm = a32 * x_norm_local + (1.0 - a32) * x_norm_global
+        x_norm = x_norm.to(x.dtype)
 
         if self.affine:
             x_norm = x_norm * self.affine_scale.view(1, 1, -1) + self.affine_bias.view(1, 1, -1)
@@ -329,12 +340,21 @@ class TokenAdaptiveNorm(nn.Module):
         mu_l = ctx["mu_l"]          # [B, C, N]
         std_l = ctx["std_l"]        # [B, C, N]
 
+        out_dtype = y.dtype
+        y_f = y.float()
         if self.affine:
-            y = (y - self.affine_bias.view(1, 1, -1)) / (self.affine_scale.view(1, 1, -1) + self.eps)
+            scale = self.affine_scale.view(1, 1, -1).float()
+            # 若 |scale| 过小则替换为 std_floor，避免 fp16 下 1/scale 溢出
+            safe_scale = torch.where(
+                scale.abs() < self.std_floor,
+                torch.full_like(scale, self.std_floor),
+                scale,
+            )
+            y_f = (y_f - self.affine_bias.view(1, 1, -1).float()) / safe_scale
 
         # 使用输入序列最后一个 token 的统计作为预测阶段的局部统计量
-        mu_l_last = mu_l[:, :, -1].unsqueeze(1)                         # [B, 1, C]
-        std_l_last = std_l[:, :, -1].unsqueeze(1)                       # [B, 1, C]
+        mu_l_last = mu_l[:, :, -1].unsqueeze(1).float()                 # [B, 1, C]
+        std_l_last = std_l[:, :, -1].unsqueeze(1).float().clamp_min(self.std_floor)  # [B, 1, C]
 
         # 自适应反归一化混合系数
         if self.use_freq_cond and freq_features_last is not None:
@@ -347,7 +367,8 @@ class TokenAdaptiveNorm(nn.Module):
         else:
             beta = torch.sigmoid(self.beta).expand(B, 1, C)
 
-        y_local = y * std_l_last + mu_l_last
-        y_global = y * std_g + mu_g
+        beta = beta.float()
+        y_local = y_f * std_l_last + mu_l_last
+        y_global = y_f * std_g.float() + mu_g.float()
         y_out = beta * y_local + (1.0 - beta) * y_global
-        return y_out
+        return y_out.to(out_dtype)

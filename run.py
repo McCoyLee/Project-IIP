@@ -133,6 +133,8 @@ if __name__ == '__main__':
                         help='enable token-adaptive normalization (per-patch local stats + freq-conditioned mixing)')
     parser.add_argument('--tan_freq_cond', action='store_true', default=True,
                         help='use freq features to drive TAN mixing coefficient alpha/beta')
+    parser.add_argument('--tan_no_freq_cond', action='store_true', default=False,
+                        help='ablation: disable freq conditioning in TAN (fall back to fixed alpha/beta)')
     parser.add_argument('--tan_bands', type=int, default=8,
                         help='number of frequency bands K for TAN freq conditioning')
 
@@ -307,7 +309,11 @@ if __name__ == '__main__':
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            if not args.ddp and not args.dp:
+            if args.ddp:
+                # DDP 模式：只在 rank 0 上跑测试（模型已在 train() 末尾 load 最优 ckpt）
+                if args.local_rank == 0:
+                    exp.test(setting)
+            elif not args.dp:
                 exp.test(setting)
             torch.cuda.empty_cache()
     else:

@@ -40,18 +40,11 @@ class EarlyStopping:
 
     def __call__(self, val_loss, model, path):
         score = -val_loss
+        improved = False
         if self.best_score is None:
             self.best_score = score
-            if self.verbose:
-                print(
-                    f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).')
             self.val_loss_min = val_loss
-            if self.ddp:
-                if self.local_rank == 0:
-                    self.save_checkpoint(val_loss, model, path)
-                dist.barrier()
-            else:
-                self.save_checkpoint(val_loss, model, path)
+            improved = True
         elif score < self.best_score + self.delta:
             self.counter += 1
             print(
@@ -60,17 +53,22 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
-            if self.ddp:
-                if self.local_rank == 0:
-                    self.save_checkpoint(val_loss, model, path)
-                dist.barrier()
-            else:
-                self.save_checkpoint(val_loss, model, path)
             if self.verbose:
                 print(
                     f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).')
             self.val_loss_min = val_loss
             self.counter = 0
+            improved = True
+
+        # Save & barrier: barrier is UNCONDITIONAL so all ranks always
+        # reach it together — avoids NCCL timeout if ranks ever disagree.
+        if self.ddp:
+            if improved and self.local_rank == 0:
+                self.save_checkpoint(val_loss, model, path)
+            dist.barrier()  # all ranks, every epoch, regardless of improved
+        else:
+            if improved:
+                self.save_checkpoint(val_loss, model, path)
 
     def save_checkpoint(self, val_loss, model, path):
         if self.dp:
