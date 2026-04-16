@@ -212,10 +212,11 @@ class TokenAdaptiveNorm(nn.Module):
 
     @staticmethod
     def _global_stats(x: torch.Tensor, std_floor: float):
-        # x: [B, L, C]；用 std_floor 限制下限以避免 fp16 下的 1/std 溢出
+        # x: [B, L, C]；全程 float32；clamp 放在 sqrt 内部避免 autograd sqrt(0) → NaN
         x_f = x.float()
         mean = x_f.mean(dim=1, keepdim=True)                              # [B,1,C]
-        std = x_f.std(dim=1, unbiased=False, keepdim=True).clamp_min(std_floor)
+        var = x_f.var(dim=1, unbiased=False, keepdim=True)
+        std = torch.sqrt(var.clamp_min(std_floor * std_floor))            # [B,1,C]
         return mean, std
 
     @staticmethod
@@ -225,7 +226,8 @@ class TokenAdaptiveNorm(nn.Module):
         Returns:
             mu_local  : [B, C, N]
             std_local : [B, C, N]
-        全程 float32 计算，避免 fp16 下 var→0 时 sqrt 再 clamp 失败。
+        全程 float32；clamp 放在 sqrt 内部：sqrt(var.clamp_min(floor^2)) 而非
+        sqrt(var).clamp_min(floor)，后者在 var=0 时 autograd 产生 0/0=NaN。
         """
         B, L, C = x.shape
         P, S = int(patch_len), int(stride)
@@ -241,7 +243,8 @@ class TokenAdaptiveNorm(nn.Module):
             patches = patches[:, :, :n_tokens, :]
         mu = patches.mean(dim=-1)                                       # [B,C,N]
         var = patches.var(dim=-1, unbiased=False)
-        std = torch.sqrt(var).clamp_min(std_floor)                      # [B,C,N]，下限避免 fp16 溢出
+        # 关键：clamp 在 sqrt 内，避免 sqrt(0).backward() → grad=0/(2*0)=NaN
+        std = torch.sqrt(var.clamp_min(std_floor * std_floor))           # [B,C,N]
         return mu, std
 
     def forward_in(self, x: torch.Tensor, freq_features: torch.Tensor, n_tokens: int):
