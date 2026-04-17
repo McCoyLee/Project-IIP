@@ -211,8 +211,6 @@ class Model(nn.Module):
                 stride=self.patch_stride,
                 freq_dim=self._freq_K if self.tan_freq_cond else 0,
                 use_freq_cond=self.tan_freq_cond,
-                eps=1e-5,
-                affine=True,
             )
         else:
             self.tan = None
