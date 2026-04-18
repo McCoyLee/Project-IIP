@@ -96,6 +96,8 @@ class MoEFeedForward(nn.Module):
         # 路由器零初始化：均匀起步更稳
         nn.init.zeros_(self.gate.weight)
         nn.init.zeros_(self.gate.bias)
+        if self.use_fir and self.fir_freq_dim > 0:
+            nn.init.normal_(self.gate.weight[:, d_model:], std=0.1)
 
         # 可学习温度（softplus>0），不启用则为常数
         if self.learnable_gate_temp:

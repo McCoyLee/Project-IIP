@@ -253,6 +253,7 @@ class TokenAdaptiveNorm(nn.Module):
         # --- 残差归一化 ---
         x_f = x.float()
         x_local_norm = (x_f - mu_t) / std_t                          # detach stats → safe
+        x_local_norm = x_local_norm.clamp(-10.0, 10.0)               # prevent fp16 overflow in attention
         g32 = g_t.float()
         x_out = (1.0 - g32) * x_f + g32 * x_local_norm
         x_out = x_out.to(x.dtype)
