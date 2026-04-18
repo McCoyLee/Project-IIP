@@ -90,6 +90,7 @@ MOE_ARGS=(
     --moe_capacity_factor 1.25
     --moe_lb_alpha 0.003 --moe_kl_alpha 1e-3
     --moe_gate_temp 1.3 --moe_gate_noise_std 0.05 --moe_learnable_temp
+    --moe_init_noise 0.02
 )
 
 # ---------- 跑全部 5 个变体 ----------
