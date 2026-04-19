@@ -65,17 +65,21 @@ class PerTokenFreqExtractor(nn.Module):
         """
         patches: [B*C, N, P] or [*, P] where P is patch length.
         Returns: same leading dims with last dim = K.
-        """
-        # Compute rFFT along the last (time) axis of each patch
-        Xf = torch.fft.rfft(patches, dim=-1)               # [..., F]
-        Fbins = Xf.shape[-1]
-        W = self.bank(Fbins, device=Xf.device, dtype=Xf.real.dtype)  # [K, F]
-        power = Xf.real ** 2 + Xf.imag ** 2                # [..., F]
-        band_power = torch.einsum('...f,kf->...k', power, W)         # [..., K]
 
-        # Normalize to a distribution per token (sum to 1). This makes the
-        # feature scale-invariant and robust to overall amplitude differences.
-        band_power = band_power / (band_power.sum(dim=-1, keepdim=True) + 1e-9)
+        Must run entirely in float32: FFT power values easily exceed
+        float16 max (65504), causing Inf -> Inf/Inf -> NaN in the
+        normalization.  Disabling autocast prevents einsum's internal
+        bmm from casting to float16.
+        """
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            patches = patches.float()
+            Xf = torch.fft.rfft(patches, dim=-1)                # [..., F]
+            Fbins = Xf.shape[-1]
+            W = self.bank(Fbins, device=Xf.device, dtype=torch.float32)  # [K, F]
+            power = Xf.real ** 2 + Xf.imag ** 2                 # [..., F]
+            band_power = torch.einsum('...f,kf->...k', power, W)         # [..., K]
+
+            band_power = band_power / (band_power.sum(dim=-1, keepdim=True) + 1e-9)
         return band_power
 
 
