@@ -39,6 +39,8 @@ data_dict = {
     'Electricity': MultivariateDatasetBenchmark,
     'Exchange': MultivariateDatasetBenchmark,
     'Solar': MultivariateDatasetBenchmark,
+    'Traffic': MultivariateDatasetBenchmark,
+    'ILI': MultivariateDatasetBenchmark,
 }
 
 
