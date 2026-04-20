@@ -369,7 +369,10 @@ class Model(nn.Module):
             )  # [B*C, N, K]
 
         # ---------- 归一化（TAN 或传统路径）----------
-        x, x_raw, ctx = self._pre_norm(x, freq_all=freq_all_bc, n_tokens=N_pre)
+        # TAN only needs freq as conditioning signal; detach to avoid
+        # gradient flowing from TAN loss back to bank parameters.
+        freq_for_tan = freq_all_bc.detach() if freq_all_bc is not None else None
+        x, x_raw, ctx = self._pre_norm(x, freq_all=freq_for_tan, n_tokens=N_pre)
 
         # ---------- Patch tokenize ----------
         tokens, meta = self.patch(x)     # tokens: [B*C, N, d], meta=(B,C,N)
@@ -469,7 +472,8 @@ class Model(nn.Module):
         freq_last_for_tan = None
         if self.tan is not None and freq_all_bc is not None:
             # 取最后一个输入 token 的频率特征：[B*C, K] -> [B, C, K]
-            last_k = freq_all_bc[:, -1, :]
+            # Detach: TAN uses freq as conditioning, not for training bank params.
+            last_k = freq_all_bc[:, -1, :].detach()
             freq_last_for_tan = last_k.view(B, C, -1)
         out = self._post_denorm(out, ctx, freq_features_last=freq_last_for_tan)
 
