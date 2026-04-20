@@ -218,56 +218,62 @@ class TokenAdaptiveNorm(nn.Module):
         freq_features: [B*C, N, K] or None
         n_tokens:      N
         Returns:       (x_out [B,L,C], ctx dict)
+
+        Runs entirely in float32 (like LayerNorm/BatchNorm under AMP):
+        gate backward in float16 overflows with GradScaler.
         """
-        B, L, C = x.shape
-        N = int(n_tokens)
+        orig_dtype = x.dtype
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            x = x.float()
+            if freq_features is not None:
+                freq_features = freq_features.float()
 
-        # --- detached per-patch statistics ---
-        mu_l, std_l = self._local_stats(
-            x, self.patch_len, self.stride, N, self.std_floor)        # [B,C,N]
+            B, L, C = x.shape
+            N = int(n_tokens)
 
-        # --- 映射 per-patch → per-timestep（nearest-token）---
-        device = x.device
-        token_centers = (torch.arange(N, device=device).float()
-                         * self.stride + self.patch_len / 2.0)
-        time_idx = torch.arange(L, device=device).float()
-        tok_per_time = (time_idx.unsqueeze(1) - token_centers.unsqueeze(0)
-                        ).abs().argmin(dim=1)                         # [L]
+            # --- detached per-patch statistics ---
+            mu_l, std_l = self._local_stats(
+                x, self.patch_len, self.stride, N, self.std_floor)        # [B,C,N]
 
-        mu_t = mu_l[:, :, tok_per_time].permute(0, 2, 1)             # [B,L,C] detached
-        std_t = std_l[:, :, tok_per_time].permute(0, 2, 1)           # [B,L,C] detached
+            # --- 映射 per-patch → per-timestep（nearest-token）---
+            device = x.device
+            token_centers = (torch.arange(N, device=device).float()
+                             * self.stride + self.patch_len / 2.0)
+            time_idx = torch.arange(L, device=device).float()
+            tok_per_time = (time_idx.unsqueeze(1) - token_centers.unsqueeze(0)
+                            ).abs().argmin(dim=1)                         # [L]
 
-        # --- 频率条件门控 ---
-        _has_freq = self.use_freq_cond and freq_features is not None
-        if _has_freq:
-            # [B*C,N,K] → [B,C,N,K]
-            ff = freq_features.view(B, C, N, -1)
-            g_tok = torch.sigmoid(self.gate(ff)).squeeze(-1)          # [B,C,N]
-            g_t = g_tok[:, :, tok_per_time].permute(0, 2, 1)         # [B,L,C]
-            g_last = g_tok[:, :, -1]                                  # [B,C]
-        else:
-            g_val = torch.sigmoid(self.gate_param)
-            g_t = g_val.view(1, 1, 1).expand(B, L, C)
-            g_last = g_val.view(1, 1).expand(B, C)
+            mu_t = mu_l[:, :, tok_per_time].permute(0, 2, 1)             # [B,L,C] detached
+            std_t = std_l[:, :, tok_per_time].permute(0, 2, 1)           # [B,L,C] detached
 
-        # --- 残差归一化 ---
-        x_f = x.float()
-        x_local_norm = (x_f - mu_t) / std_t                          # detach stats → safe
-        x_local_norm = x_local_norm.clamp(-10.0, 10.0)               # prevent fp16 overflow in attention
-        g32 = g_t.float()
-        x_out = (1.0 - g32) * x_f + g32 * x_local_norm
-        x_out = x_out.to(x.dtype)
+            # --- 频率条件门控 ---
+            _has_freq = self.use_freq_cond and freq_features is not None
+            if _has_freq:
+                # [B*C,N,K] → [B,C,N,K]
+                ff = freq_features.view(B, C, N, -1)
+                g_tok = torch.sigmoid(self.gate(ff)).squeeze(-1)          # [B,C,N]
+                g_t = g_tok[:, :, tok_per_time].permute(0, 2, 1)         # [B,L,C]
+                g_last = g_tok[:, :, -1]                                  # [B,C]
+            else:
+                g_val = torch.sigmoid(self.gate_param)
+                g_t = g_val.view(1, 1, 1).expand(B, L, C)
+                g_last = g_val.view(1, 1).expand(B, C)
 
-        # --- 存储反归一化所需信息 ---
-        mu_last = mu_l[:, :, -1]                                      # [B,C]
-        std_last = std_l[:, :, -1]                                    # [B,C]
-        ctx = {
-            "mu_last": mu_last.detach(),    # [B,C]
-            "std_last": std_last.detach(),  # [B,C]
-            "g_last": g_last.detach(),      # [B,C]
-        }
-        self._cache = ctx
-        return x_out, ctx
+            # --- 残差归一化 ---
+            x_local_norm = (x - mu_t) / std_t                            # detach stats → safe
+            x_local_norm = x_local_norm.clamp(-10.0, 10.0)
+            x_out = (1.0 - g_t) * x + g_t * x_local_norm
+
+            # --- 存储反归一化所需信息 ---
+            mu_last = mu_l[:, :, -1]                                      # [B,C]
+            std_last = std_l[:, :, -1]                                    # [B,C]
+            ctx = {
+                "mu_last": mu_last.detach(),    # [B,C]
+                "std_last": std_last.detach(),  # [B,C]
+                "g_last": g_last.detach(),      # [B,C]
+            }
+            self._cache = ctx
+        return x_out.to(orig_dtype), ctx
 
     # -----------------------------------------------------------------
     def forward_out(self, y: torch.Tensor, ctx: dict = None,
@@ -284,19 +290,22 @@ class TokenAdaptiveNorm(nn.Module):
             return y
 
         out_dtype = y.dtype
-        y_f = y.float()
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            y_f = y.float()
+            if freq_features_last is not None:
+                freq_features_last = freq_features_last.float()
 
-        mu = ctx["mu_last"].unsqueeze(1).float()                      # [B,1,C]
-        std = ctx["std_last"].unsqueeze(1).float()                    # [B,1,C]
+            mu = ctx["mu_last"].unsqueeze(1).float()                      # [B,1,C]
+            std = ctx["std_last"].unsqueeze(1).float()                    # [B,1,C]
 
-        # gate for denormalization
-        if self.use_freq_cond and freq_features_last is not None:
-            g = torch.sigmoid(self.gate(freq_features_last))          # [B,C,1]
-            g = g.squeeze(-1).unsqueeze(1)                            # [B,1,C]
-        else:
-            g = ctx["g_last"].unsqueeze(1).float()                    # [B,1,C]
+            # gate for denormalization
+            if self.use_freq_cond and freq_features_last is not None:
+                g = torch.sigmoid(self.gate(freq_features_last))          # [B,C,1]
+                g = g.squeeze(-1).unsqueeze(1)                            # [B,1,C]
+            else:
+                g = ctx["g_last"].unsqueeze(1).float()                    # [B,1,C]
 
-        # 反归一化：g→0 恒等，g→1 完全 local denorm
-        y_denorm = (1.0 - g) * y_f + g * (y_f * std + mu)
+            # 反归一化：g→0 恒等，g→1 完全 local denorm
+            y_denorm = (1.0 - g) * y_f + g * (y_f * std + mu)
 
         return y_denorm.to(out_dtype)
