@@ -1,0 +1,101 @@
+flowchart TB
+    classDef inp fill:#E3F2FD,stroke:#1565C0,color:#0D47A1
+    classDef norm fill:#FFF3E0,stroke:#E65100,color:#BF360C
+    classDef freq fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C
+    classDef patch fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    classDef unica fill:#FCE4EC,stroke:#AD1457,color:#880E4F
+    classDef block fill:#E0F7FA,stroke:#00838F,color:#006064
+    classDef moe fill:#FFFDE7,stroke:#F9A825,color:#F57F17
+    classDef head fill:#EDE7F6,stroke:#4527A0,color:#311B92
+    classDef aux fill:#FFEBEE,stroke:#C62828,color:#B71C1C,stroke-dasharray: 4 3
+    classDef out fill:#E8EAF6,stroke:#283593,color:#1A237E
+
+    %% ====== Input ======
+    X["x  [B, L, C]  (多变量时序)"]:::inp
+    XM["x_mark  (时间标记, 可选)"]:::inp
+
+    %% ====== Freq Extractor (shared) ======
+    FEX["PerTokenFreqExtractor<br/>layers/freq_features.py<br/>K 个可学习频带 → [B*C, N, K]"]:::freq
+
+    %% ====== Pre Norm ======
+    subgraph PRE["Pre-Normalization (四选一)"]
+      TAN["TAN · TokenAdaptiveNorm<br/>utils/adaptive_norm.py<br/>freq-conditioned token 级归一"]:::norm
+      ADA["AdaRevIN<br/>utils/adaptive_norm.py<br/>EMA detrend + α/β 可学"]:::norm
+      REV["RevIN (默认禁用)<br/>models/revin.py"]:::norm
+      STA["Statistical mean/std"]:::norm
+    end
+    class PRE norm
+
+    %% ====== Patch Frontend ======
+    PE["PatchEmbed1D<br/>layers/patch.py<br/>patch_len / stride + Pos<br/>tokens [B*C, N, d_model]"]:::patch
+
+    %% ====== UniCA Pre ======
+    UP["UniCA (stage=pre, 可选)<br/>layers/unica_cov.py<br/>协变量 FiLM / res_add"]:::unica
+
+    %% ====== AFS Pre ======
+    AP["AFS-Gate (block_pre, 可选)<br/>rFFT → K 带 softmax α → iFFT<br/>models/timer_xl.py 内联"]:::freq
+
+    %% ====== Encoder Stack ======
+    subgraph ENC["TimerBlock × e_layers  (layers/Transformer_EncDec.py)"]
+      direction TB
+      ATT["TimeAttention + AttentionLayer<br/>layers/SelfAttention_Family.py<br/>可接 DeStationaryAdapter"]:::block
+      FFN{"FFN 类型开关<br/>--use_moe"}:::block
+      DENSE["Dense FFN (Conv1d · Conv1d)"]:::block
+      MOE_V["Vanilla MoE<br/>layers/moe_ffn.py<br/>Top-k + capacity + LB/KL/z-loss"]:::moe
+      MOE_SR["Shared + Routed Top-2 MoE<br/>layers/moe_shared_routed.py"]:::moe
+      FIR["FIR-MoE (频率引导路由)<br/>router([h_token ; f_band])<br/>+ L_spec / L_ortho 正则"]:::moe
+      ATT --> FFN
+      FFN -->|use_moe=false| DENSE
+      FFN -->|vanilla| MOE_V
+      FFN -->|shared_routed_top2| MOE_SR
+      FFN -->|use_fir_moe| FIR
+    end
+
+    %% ====== UniCA Post ======
+    UPO["UniCA (stage=post, 可选)<br/>非 CI 主干直接融合<br/>CI 主干 → Conv1d(C→C) 跨变量"]:::unica
+
+    %% ====== AFS Post ======
+    APO["AFS-Gate (block_post, 可选)<br/>可缓存 α 作为 MoE 先验"]:::freq
+
+    %% ====== Head ======
+    HEAD["PatchUnembedHead<br/>layers/patch.py<br/>head_type: last / mean / tokenwise"]:::head
+
+    %% ====== Denorm ======
+    DN["Post-Denorm<br/>对应 TAN / AdaRevIN / RevIN / stat 反演<br/>TAN 使用最后 token 频率特征"]:::norm
+
+    %% ====== Output ======
+    OUT["ŷ  [B, H, C]  预测"]:::out
+
+    %% ====== Aux Losses ======
+    AUX["Auxiliary Losses (exp/exp_forecast.py 汇总)<br/>• MoE: balance_switch + KL + z-loss + entropy<br/>• FIR: L_spec (专家频率特化) + L_ortho<br/>• TAN: 稳定性正则 (可选)<br/>• Eval: --eval_target_only → utils/metrics.py 目标通道指标"]:::aux
+
+    %% ====== Flow ======
+    X --> FEX
+    X --> TAN
+    X --> ADA
+    X --> REV
+    X --> STA
+    XM --> UP
+    XM --> UPO
+
+    TAN --> PE
+    ADA --> PE
+    REV --> PE
+    STA --> PE
+
+    FEX -. 频率条件 .-> TAN
+    FEX -. f_band 路由特征 .-> FIR
+    FEX -. 最后 token 频率 .-> DN
+
+    PE --> UP --> AP --> ENC
+    ENC --> UPO --> APO --> HEAD --> DN --> OUT
+
+    MOE_V -. aux .-> AUX
+    MOE_SR -. aux .-> AUX
+    FIR -. L_spec/L_ortho .-> AUX
+    TAN -. reg .-> AUX
+
+    %% ====== Data provider note ======
+    DP["data_provider/*<br/>target_channel 切片 + 协变量打包"]:::inp
+    DP --> X
+    DP --> XM
