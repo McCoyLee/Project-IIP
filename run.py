@@ -138,6 +138,12 @@ if __name__ == '__main__':
     parser.add_argument('--tan_bands', type=int, default=8,
                         help='number of frequency bands K for TAN freq conditioning')
 
+    # ---- Spectral Consistency Loss ----
+    parser.add_argument('--use_spectral_loss', action='store_true', default=False,
+                        help='add spectral consistency regularization to MSE loss')
+    parser.add_argument('--spectral_lambda', type=float, default=0.1,
+                        help='weight of spectral consistency loss')
+
     # ---- basic config ----
     parser.add_argument('--task_name', type=str, required=True, default='forecast', help='task name, options:[forecast]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')

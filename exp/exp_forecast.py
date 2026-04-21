@@ -20,6 +20,21 @@ torch.set_float32_matmul_precision("high")  # 可选：在 Ampere+/Ada 上略提
 warnings.filterwarnings('ignore')
 
 
+def spectral_consistency_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Penalise power-spectrum mismatch between prediction and ground truth.
+
+    pred, target: [B, H, C]  (time-domain signals)
+    Returns scalar loss = mean(|power_pred - power_target|) over all freq bins.
+    Runs in float32 to avoid FFT overflow in fp16.
+    """
+    with torch.amp.autocast(device_type='cuda', enabled=False):
+        pred_f = pred.float()
+        target_f = target.float()
+        P_pred = torch.fft.rfft(pred_f, dim=1).abs().pow(2)
+        P_true = torch.fft.rfft(target_f, dim=1).abs().pow(2)
+        return (P_pred - P_true).abs().mean()
+
+
 class Exp_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Forecast, self).__init__(args)
@@ -222,6 +237,11 @@ class Exp_Forecast(Exp_Basic):
                             batch_y = batch_y[:, :, -1]
 
                     loss = criterion(outputs, batch_y)
+
+                    # ==== Spectral consistency loss（可选）====
+                    if getattr(self.args, 'use_spectral_loss', False):
+                        lam_s = getattr(self.args, 'spectral_lambda', 0.1)
+                        loss = loss + lam_s * spectral_consistency_loss(outputs, batch_y)
 
                     # ==== MoE aux：使用 model.moe_aux_loss() 读取 total_live 以保留梯度 ====
                     # 说明：旧实现走 _moe_aux_total buffer（detached），会丢失 FIR-MoE 频率
