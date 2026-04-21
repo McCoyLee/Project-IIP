@@ -47,7 +47,12 @@ scripts/jobs/table3_96pred96_paper_multigpu.sh
 
 特点：
 
-1. 固定 Timer-XL 主干为 `L=5, D=512, H=8, d_ff=2048, P=96, epochs=10`
+1. 采用 **数据集级** Table 11 配置（不是所有数据集都用同一主干）
+   - ECL: `L=5,D=512,H=8,d_ff=2048,LR=5e-4,BS=4`
+   - ETTh1: `L=1,D=1024,H=8,d_ff=4096,LR=1e-4,BS=32`
+   - Traffic: `L=4,D=512,H=8,d_ff=2048,LR=5e-4,BS=4`
+   - Weather: `L=4,D=512,H=8,d_ff=2048,LR=5e-4,BS=32`
+   - Solar: `L=6,D=512,H=8,d_ff=2048,LR=1e-4,BS=16`
 2. 保持 DDP 多卡
 3. 自动按 `NPROC_PER_NODE` 计算每卡 batch，使全局 batch 与论文值一致
 4. 仅覆盖 Table 3 的 5 个数据集（ECL/ETTh1/Traffic/Weather/Solar）
