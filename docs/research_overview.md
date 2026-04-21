@@ -45,14 +45,23 @@ $$\mathcal{L}_{\text{spec}} = -\frac{1}{E}\sum_{e=1}^{E} D_{\text{KL}}(\mathbf{p
 
 其中 $\mathbf{p}_e$ 是专家 $e$ 被分配 token 的平均频率分布。该正则鼓励每个专家关注不同的频带，实现自然的"趋势专家"/"季节性专家"/"噪声专家"特化。
 
-### 2.3 两者的统一
+### 2.3 频谱一致性正则（Spectral Consistency Regularization）
 
-TAN 和 FIR-MoE **共享同一个频率特征提取器**，构成从预处理到推理的全链路频率自适应框架：
+在 MSE loss 基础上添加频域约束，惩罚预测信号与真实信号的功率谱差异：
 
-| 模块 | 自适应对象 | 频率特征用途 |
-|------|-----------|-------------|
-| TAN | 归一化强度 | 频带能量 → 归一化门控 $g_i$ |
-| FIR-MoE | 专家分配 | 频带能量 → 路由权重 |
+$$\mathcal{L} = \mathcal{L}_{\text{MSE}} + \lambda_s \cdot \frac{1}{F}\sum_{k=0}^{F-1} \left| |X_{\text{pred}}[k]|^2 - |X_{\text{true}}[k]|^2 \right|$$
+
+与 TAN 形成"输入-输出双端频率自适应"的闭环：TAN 在输入侧做频率条件化归一化，频谱 loss 在输出侧做频率一致性监督。
+
+### 2.4 统一框架
+
+TAN、FIR-MoE 和频谱 loss **共享同一个核心洞察**：局部频率特性应指导模型的自适应行为。
+
+| 模块 | 作用位置 | 频率信息用途 |
+|------|---------|-------------|
+| TAN | 输入归一化 | 频带能量 → 归一化门控 $g_i$ |
+| FIR-MoE | 推理层路由 | 频带能量 → 专家分配权重 |
+| 频谱 loss | 输出监督 | 功率谱差异 → 辅助训练信号 |
 
 ## 三、实验设计
 
@@ -69,20 +78,21 @@ TAN 和 FIR-MoE **共享同一个频率特征提取器**，构成从预处理到
 |------|------|
 | Baseline | TimerXL 无增强 |
 | TAN | TimerXL + Token 自适应归一化 |
-| FIR-MoE + TAN | 完整方法 |
+| FIR-MoE + TAN | 完整方法（MoE + 频率路由 + TAN） |
 
 **指标**：MSE, MAE
 
 ### 3.2 消融实验
 
-**TAN 消融**：
-- w/o freq conditioning（固定门控值，不用频率条件）
-- w/o local stats（仅用全局统计量 + 频率门控）
-- 不同频带数 $K \in \{4, 8, 16\}$
+在 ECL、ETTm1、Traffic、Weather 上，pred_len ∈ {96, 336}：
 
-**FIR-MoE 消融**：
-- w/o freq input（退化为标准 MoE）
-- w/o specialization loss（有频率输入但不约束特化）
+| 变体 | 说明 |
+|------|------|
+| TAN (full) | 完整 TAN（K=8, freq_cond=True） |
+| w/o freq cond | TAN 去掉频率条件（固定门控） |
+| K=4 | 减少频带数 |
+| K=16 | 增加频带数 |
+| TAN + spec loss | TAN + 频谱一致性 loss |
 
 ### 3.3 可解释性分析
 
@@ -90,29 +100,54 @@ TAN 和 FIR-MoE **共享同一个频率特征提取器**，构成从预处理到
 - 专家频率签名热力图 $[\text{Experts} \times \text{Freq Bands}]$：展示不同专家的频率特化模式
 - 跨数据集对比：周期数据（ECL）vs 趋势数据（ETT）vs 噪声数据（Weather）
 
-## 四、初步结果（ECL 数据集, $H=24$）
+## 四、实验结果
 
-| 模型 | MSE | MAE | vs Baseline |
-|------|-----|-----|-------------|
-| Baseline | 0.4742 | 0.3611 | — |
-| TAN | **0.3768** | **0.3387** | **−20.5%** |
-| FIR-MoE + TAN | 0.3871 | 0.3482 | −18.4% |
+### 4.1 Phase 4 全量 Benchmark（7 数据集 × 4 预测长度 × 3 变体）
 
-TAN 在 ECL 上取得显著提升，验证了"频率条件化的局部归一化"对多变量周期数据的有效性。
+**MSE 胜率统计**：
+
+| 方法 | MSE 胜出次数（/28） | MAE 胜出次数（/28） |
+|------|-------------------|-------------------|
+| baseline | 6 | 4 |
+| **TAN** | **14** | **13** |
+| FIR-MoE+TAN | 8 | 11 |
+
+**按数据集平均 MSE**：
+
+| Dataset | n_vars | baseline | TAN | FIR-MoE+TAN | 最优 |
+|---------|--------|----------|-----|-------------|------|
+| ECL | 321 | 0.5966 | 0.6133 | **0.5826** | FIR-MoE+TAN |
+| ETTh1 | 7 | 0.2327 | **0.2099** | 0.2218 | TAN |
+| ETTh2 | 7 | 0.2093 | **0.2065** | 0.2359 | TAN |
+| ETTm1 | 7 | 0.1109 | **0.0884** | 0.1341 | TAN |
+| ETTm2 | 7 | 0.1200 | **0.1108** | 0.1276 | TAN |
+| Weather | 21 | **0.2543** | 0.2563 | 0.2583 | baseline |
+| Traffic | 862 | 0.4797 | **0.4567** | 0.5274 | TAN |
+
+### 4.2 关键观察
+
+1. **TAN 是最稳定的改进**：在 5/7 数据集上取得最低平均 MSE，长预测（720 步）优势尤为明显（如 ETTm1-720：0.1397 vs baseline 0.1685，−17.1%）
+
+2. **FIR-MoE+TAN 在高维数据集上有竞争力**：ECL (321 vars) 上平均 MSE 最低，但在低维数据集上 MoE 的 aux loss 引入退化
+
+3. **Weather 数据集区分度低**：三种方法差异 < 2%，可能因为 Weather 的突变模式对归一化策略不敏感
 
 ## 五、代码结构
 
 ```
-layers/freq_features.py     # 共享频率特征提取器（rFFT + 三角带通滤波）
-utils/adaptive_norm.py      # TAN 实现（forward_in / forward_out）
-layers/moe_ffn.py           # FIR-MoE 路由器扩展
-models/timer_xl.py          # 主模型集成
-scripts/jobs/               # 实验脚本
+layers/freq_features.py       # 共享频率特征提取器（rFFT + 三角带通滤波）
+utils/adaptive_norm.py        # TAN 实现（forward_in / forward_out）
+layers/moe_ffn.py             # FIR-MoE 路由器扩展
+models/timer_xl.py            # 主模型集成
+exp/exp_forecast.py           # 训练循环（含频谱 loss）
+scripts/jobs/
+  phase4_full_benchmark.sh    # 全量 benchmark（9 数据集 × 4 预测长度）
+  phase5_ablation.sh          # TAN 消融实验
 ```
 
 ## 六、下一步
 
-1. 在 9 个数据集 × 4 个预测长度上完成全量 benchmark
-2. 探索频谱一致性正则 $\mathcal{L}_{\text{spec}} = \lambda_s \sum_k \left| |X_{\text{pred}}[k]|^2 - |X_{\text{true}}[k]|^2 \right|$ 作为与 TAN 互补的输出侧频率约束
-3. 消融实验与可解释性可视化
-4. 论文撰写
+1. **消融实验**（Phase 5）：验证 TAN 各组件贡献，包括频率条件、频带数 K、频谱 loss
+2. **可解释性可视化**：TAN 门控值时间演化、专家频率签名热力图
+3. **外部 baseline 对比**：引用 PatchTST、iTransformer、DLinear 等已发表结果
+4. **论文撰写**
