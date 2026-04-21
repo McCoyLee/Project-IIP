@@ -29,7 +29,7 @@ conda activate timerxl
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 ONLY_DS="${ONLY_DATASET:-all}"
 SEED="${SEED:-2021}"
-MODE="${MODE:-paper_strict}" # paper_strict | official_script_like
+MODE="${MODE:-table3_matched}" # table3_matched | paper_literal
 
 calc_local_bs () {
     local global_bs="$1"
@@ -69,10 +69,15 @@ COMMON_IO=(
   --num_workers 4 --ddp
 )
 
-# optional extra switches from some official scripts (not Table 11 fields)
+# Mode policy:
+# - paper_literal: literal Table 11 fields (ETTh1 d_ff=4096, no extra flags)
+# - table3_matched: Timer-XL practical matched profile for Table3 ETTh1
+#   (ETTh1 d_ff=2048 + --use_norm --valid_last), empirically closer to paper Table3.
 EXTRA_ARGS=()
-if [[ "${MODE}" == "official_script_like" ]]; then
+ETTH1_DFF=4096
+if [[ "${MODE}" == "table3_matched" ]]; then
   EXTRA_ARGS+=(--use_norm --valid_last)
+  ETTH1_DFF=2048
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ecl" ]]; then
@@ -86,7 +91,7 @@ fi
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "etth1" ]]; then
   run_one "etth1_t3_timerxl_paper" "logs/table3_paper/etth1" "checkpoints/table3_paper/etth1" \
     "${COMMON_IO[@]}" "${EXTRA_ARGS[@]}" \
-    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 4096 \
+    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff ${ETTH1_DFF} \
     --data ETTh1 --root_path "${DATA_ROOT}/ETT" --data_path ETTh1.csv \
     --learning_rate 1e-4 --batch_size "$(calc_local_bs 32)" --n_vars 7
 fi

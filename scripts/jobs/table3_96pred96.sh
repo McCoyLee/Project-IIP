@@ -41,7 +41,8 @@ elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
 fi
 conda activate timerxl
 
-NGPU=8
+NGPU="${NGPU:-8}"
+SEED_ENV="${SEED:-42}"
 ONLY_DS="${ONLY_DATASET:-all}"
 ONLY_VAR="${ONLY_VARIANT:-all}"
 
@@ -106,7 +107,7 @@ COMMON=(
     --e_layers 3 --d_model 256 --n_heads 4 --d_ff 1024
     --dropout 0.1 --learning_rate 1e-4
     --train_epochs 50 --patience 5
-    --seed 42 --cosine --tmax 50
+    --seed "${SEED_ENV}" --cosine --tmax 50
     --ci_backbone --patch_size 0 --stride 0
     --num_workers 4 --ddp
 )
