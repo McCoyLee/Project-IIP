@@ -60,7 +60,7 @@ COMMON_IO=(
   --seq_len 672 --input_token_len 96 --input_token_stride 96
   --output_token_len 96 --test_pred_len 96
   --dropout 0.1 --train_epochs 10 --patience 10
-  --seed 42 --patch_size 0 --stride 0
+  --seed 42 --patch_size 0 --stride 0 --use_norm --valid_last
   --num_workers 4 --ddp
 )
 
@@ -69,7 +69,7 @@ if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ecl" ]]; then
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "etth1" ]]; then
-  run_one "etth1_t3_timerxl_paper" "logs/table3_paper/etth1" "checkpoints/table3_paper/etth1"     "${COMMON_IO[@]}"     --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 4096     --data ETTh1 --root_path "${DATA_ROOT}/ETT" --data_path ETTh1.csv     --learning_rate 1e-4 --batch_size "$(calc_local_bs 32)" --n_vars 7
+  run_one "etth1_t3_timerxl_paper" "logs/table3_paper/etth1" "checkpoints/table3_paper/etth1"     "${COMMON_IO[@]}"     --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 2048     --data ETTh1 --root_path "${DATA_ROOT}/ETT" --data_path ETTh1.csv     --learning_rate 1e-4 --batch_size "$(calc_local_bs 32)" --n_vars 7
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "traffic" ]]; then

@@ -81,3 +81,6 @@ NPROC_PER_NODE=8 ONLY_DATASET=etth1 bash scripts/jobs/table3_96pred96_paper_mult
 - 数据集路径和文件名必须与脚本一致（`ETT/ETTh1.csv`、`Electricity/ECL.csv` 等）。
 - 尽量不要混入旧脚本的 `--ci_backbone` 或其它论文未给出的策略。
 - 先单数据集逐个对齐（如先 ETTh1），再跑全表。
+
+
+- ETTh1 若仍偏高，优先确认是否启用了 `--use_norm --valid_last`（官方 ETTh1 脚本常用）。
