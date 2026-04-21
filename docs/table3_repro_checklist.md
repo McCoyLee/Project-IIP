@@ -76,6 +76,5 @@ scripts/jobs/compare_table3_multi_dataset.sh
 
 1. `MODE=paper_literal`（字面对照）
 2. `MODE=table3_matched`（推荐复现）
-3. 你的实验脚本 `table3_96pred96.sh` 的 baseline
 
-并输出统一 CSV，字段包含每个数据集三条线的 `mse/mae`，便于横向公平比较。
+并在 CSV 中直接给出与 **Table 3 目标值** 的 gap（`|run - target|`），避免与旧 baseline 脚本（不同设定）混比。
