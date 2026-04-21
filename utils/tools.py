@@ -71,7 +71,7 @@ class EarlyStopping:
                 self.save_checkpoint(val_loss, model, path)
 
     def save_checkpoint(self, val_loss, model, path):
-        if self.dp:
+        if self.dp or self.ddp:
             model = model.module
         param_grad_dic = {
             k: v.requires_grad for (k, v) in model.named_parameters()
