@@ -341,10 +341,15 @@ class Exp_Forecast(Exp_Basic):
             best_model_path = self.args.test_file_name
             print("loading model from {}".format(os.path.join(self.args.checkpoints, setting, best_model_path)))
             checkpoint = torch.load(os.path.join(self.args.checkpoints, setting, best_model_path))
+            # Strip 'module.' prefix from DDP checkpoints if loading into non-DDP model
+            cleaned = {}
+            for k, v in checkpoint.items():
+                cleaned[k.replace('module.', '', 1) if k.startswith('module.') else k] = v
+            checkpoint = cleaned
             for name, param in self.model.named_parameters():
                 if not param.requires_grad and name not in checkpoint:
                     checkpoint[name] = param
-            self.model.load_state_dict(checkpoint)
+            self.model.load_state_dict(checkpoint, strict=False)
 
         preds = []
         trues = []
