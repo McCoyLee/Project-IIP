@@ -57,7 +57,7 @@ run_one () {
 
 COMMON_IO=(
   --task_name forecast --is_training 1 --model timer_xl
-  --seq_len 96 --input_token_len 96 --input_token_stride 96
+  --seq_len 672 --input_token_len 96 --input_token_stride 96
   --output_token_len 96 --test_pred_len 96
   --dropout 0.1 --train_epochs 10 --patience 10
   --seed 42 --patch_size 0 --stride 0
