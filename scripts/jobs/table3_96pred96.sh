@@ -14,7 +14,7 @@
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,garbage_collection_threshold:0.8}
 export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 
 : "${DATA_ROOT:?请先 export DATA_ROOT=/你的/数据根目录}"

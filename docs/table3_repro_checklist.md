@@ -104,6 +104,10 @@ scripts/jobs/compare_table3_multi_dataset.sh
 
 并默认启用：
 
-- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`
+- `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8`
 
 用于缓解显存碎片。
+
+
+- 若出现 `expandable_segment_ INTERNAL ASSERT FAILED`，请不要使用 `expandable_segments:True`。
+  建议：`PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8`。
