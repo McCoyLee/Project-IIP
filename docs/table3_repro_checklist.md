@@ -81,3 +81,13 @@ scripts/jobs/compare_table3_multi_dataset.sh
 并输出统一 CSV：
 - 对有论文目标值的数据集（ecl/etth1/traffic/weather/solar）给出 `|run-target|` gap
 - 对其余数据集（etth2/ettm1/ettm2/exchange）保留 `target=NA`，只做方法间横向比较。
+
+## 7) 重要更新：原始 table3_96pred96.sh 已改为论文对齐参数
+
+为避免“compare 脚本里比较对象不公平”，`scripts/jobs/table3_96pred96.sh` 已直接改成论文对齐主干：
+
+- lookback 统一 `seq_len=672`
+- 5 个主数据集采用与 Table 3 更一致的 dataset-specific 配置
+- baseline/tan/fir_moe_tan 都在同一套对齐主干上比较
+
+这样你直接跑 `table3_96pred96.sh` 本身，就更接近论文对标口径。
