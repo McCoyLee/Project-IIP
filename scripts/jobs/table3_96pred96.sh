@@ -1,29 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Table 3 — Multivariate forecasting (96-pred-96), trained from scratch
+# Table 3 runner (paper-aligned baseline/experiment settings)
 #
-# 对齐论文 Table 3：seq_len=96, pred_len=96, 直接预测（无 rolling）
-# 所有模型从头训练，评估全部通道的 MSE/MAE
+# 目标：在原 table3.sh 基础上，把 baseline/tan/fir_moe_tan 的主干参数
+# 对齐到与论文 Table 3 更一致的设置，避免旧脚本（sl96, dm256, el3）造成系统性偏差。
 #
-# 数据集: ECL, ETTh1, ETTh2, ETTm1, ETTm2, Weather, Traffic, Solar, Exchange
-# 变体:   baseline, tan, fir_moe_tan
-#
-# 参数: d_model=256, d_ff=1024, n_heads=4, e_layers=3
-#
-# 使用方法：
-#   export DATA_ROOT=/home/你的用户名/datasets
-#   bash scripts/jobs/table3_96pred96.sh
-#
-#   ONLY_DATASET=ecl bash scripts/jobs/table3_96pred96.sh
-#   ONLY_VARIANT=tan bash scripts/jobs/table3_96pred96.sh
+# 用法：
+#   export DATA_ROOT=/path/to/datasets
+#   SEED=2021 NGPU=8 ONLY_DATASET=etth1 ONLY_VARIANT=baseline \
+#     bash scripts/jobs/table3_96pred96.sh
 # ============================================================================
 
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF='max_split_size_mb:128,garbage_collection_threshold:0.8'
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
 export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 
@@ -41,16 +30,10 @@ elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
 fi
 conda activate timerxl
 
-NGPU=8
+NGPU="${NGPU:-8}"
+SEED_ENV="${SEED:-2021}"
 ONLY_DS="${ONLY_DATASET:-all}"
 ONLY_VAR="${ONLY_VARIANT:-all}"
-
-echo "=========================================="
-echo " Table 3 — 96-pred-96, from scratch"
-echo " d_model=256, d_ff=1024, n_heads=4, e_layers=3"
-echo " DATA_ROOT = $DATA_ROOT"
-echo " Filter DS = $ONLY_DS  |  Filter VA = $ONLY_VAR"
-echo "=========================================="
 
 run_one () {
     local model_id="$1"; shift
@@ -59,7 +42,6 @@ run_one () {
     local ts; ts=$(date +%F_%H-%M-%S)
     local log="${log_dir}/${model_id}__${ts}.log"
     mkdir -p "$ckpt_dir" "$log_dir"
-    echo ""
     echo "[$(date)] >>> ${model_id}" | tee -a "$log"
     torchrun \
         --standalone --nnodes=1 --nproc_per_node="${NGPU}" \
@@ -98,91 +80,93 @@ run_variants () {
     fi
 }
 
-# ---- 公共参数：Table 3 (96-pred-96, 从头训练) ----
-COMMON=(
+# 通用 IO：Table 3 为 96-pred-96，但 lookback 采用 672（7*96）
+COMMON_IO=(
     --task_name forecast --is_training 1 --model timer_xl
-    --seq_len 96 --input_token_len 96 --input_token_stride 96
+    --seq_len 672 --input_token_len 96 --input_token_stride 96
     --output_token_len 96 --test_pred_len 96
-    --e_layers 3 --d_model 256 --n_heads 4 --d_ff 1024
-    --dropout 0.1 --learning_rate 1e-4
-    --train_epochs 50 --patience 5
-    --seed 42 --cosine --tmax 50
-    --ci_backbone --patch_size 0 --stride 0
+    --dropout 0.1 --train_epochs 10 --patience 10
+    --seed "${SEED_ENV}" --patch_size 0 --stride 0
     --num_workers 4 --ddp
 )
 
-# ============================================================================
+# --------------------------- 论文主对齐的 5 个数据集 ---------------------------
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ecl" ]]; then
-echo "========== ECL =========="
 run_variants ecl "logs/table3/ecl" "checkpoints/table3/ecl" \
-    "${COMMON[@]}" --data Electricity \
-    --root_path "${DATA_ROOT}/Electricity" --data_path ECL.csv \
-    --batch_size 4 --n_vars 321
+    "${COMMON_IO[@]}" \
+    --e_layers 5 --d_model 512 --n_heads 8 --d_ff 2048 \
+    --learning_rate 5e-4 --batch_size 4 \
+    --data Electricity --root_path "${DATA_ROOT}/Electricity" --data_path ECL.csv --n_vars 321
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "etth1" ]]; then
-echo "========== ETTh1 =========="
 run_variants etth1 "logs/table3/etth1" "checkpoints/table3/etth1" \
-    "${COMMON[@]}" --data ETTh1 \
-    --root_path "${DATA_ROOT}/ETT" --data_path ETTh1.csv \
-    --batch_size 32 --n_vars 7
-fi
-
-if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "etth2" ]]; then
-echo "========== ETTh2 =========="
-run_variants etth2 "logs/table3/etth2" "checkpoints/table3/etth2" \
-    "${COMMON[@]}" --data ETTh2 \
-    --root_path "${DATA_ROOT}/ETT" --data_path ETTh2.csv \
-    --batch_size 32 --n_vars 7
-fi
-
-if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ettm1" ]]; then
-echo "========== ETTm1 =========="
-run_variants ettm1 "logs/table3/ettm1" "checkpoints/table3/ettm1" \
-    "${COMMON[@]}" --data ETTm1 \
-    --root_path "${DATA_ROOT}/ETT" --data_path ETTm1.csv \
-    --batch_size 32 --n_vars 7
-fi
-
-if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ettm2" ]]; then
-echo "========== ETTm2 =========="
-run_variants ettm2 "logs/table3/ettm2" "checkpoints/table3/ettm2" \
-    "${COMMON[@]}" --data ETTm2 \
-    --root_path "${DATA_ROOT}/ETT" --data_path ETTm2.csv \
-    --batch_size 32 --n_vars 7
-fi
-
-if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "weather" ]]; then
-echo "========== Weather =========="
-run_variants weather "logs/table3/weather" "checkpoints/table3/weather" \
-    "${COMMON[@]}" --data Weather \
-    --root_path "${DATA_ROOT}/Weather" --data_path WTH.csv \
-    --batch_size 16 --n_vars 21
+    "${COMMON_IO[@]}" \
+    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 32 \
+    --use_norm --valid_last \
+    --data ETTh1 --root_path "${DATA_ROOT}/ETT" --data_path ETTh1.csv --n_vars 7
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "traffic" ]]; then
-echo "========== Traffic =========="
 run_variants traffic "logs/table3/traffic" "checkpoints/table3/traffic" \
-    "${COMMON[@]}" --data Traffic \
-    --root_path "${DATA_ROOT}/traffic" --data_path traffic.csv \
-    --batch_size 2 --n_vars 862
+    "${COMMON_IO[@]}" \
+    --e_layers 4 --d_model 512 --n_heads 8 --d_ff 2048 \
+    --learning_rate 5e-4 --batch_size 4 \
+    --data Traffic --root_path "${DATA_ROOT}/traffic" --data_path traffic.csv --n_vars 862
+fi
+
+if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "weather" ]]; then
+run_variants weather "logs/table3/weather" "checkpoints/table3/weather" \
+    "${COMMON_IO[@]}" \
+    --e_layers 4 --d_model 512 --n_heads 8 --d_ff 2048 \
+    --learning_rate 5e-4 --batch_size 32 \
+    --data Weather --root_path "${DATA_ROOT}/Weather" --data_path WTH.csv --n_vars 21
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "solar" ]]; then
-echo "========== Solar =========="
 run_variants solar "logs/table3/solar" "checkpoints/table3/solar" \
-    "${COMMON[@]}" --data Solar \
-    --root_path "${DATA_ROOT}/Solar" --data_path solar_AL.csv \
-    --batch_size 8 --n_vars 137
+    "${COMMON_IO[@]}" \
+    --e_layers 6 --d_model 512 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 16 \
+    --data Solar --root_path "${DATA_ROOT}/Solar" --data_path solar_AL.csv --n_vars 137
+fi
+
+# --------------------------- 扩展到原脚本其余 4 个数据集 ---------------------------
+# 这些数据集不在你贴的 Table 3 图中，用 ETTh1 同族配置作为默认扩展。
+if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "etth2" ]]; then
+run_variants etth2 "logs/table3/etth2" "checkpoints/table3/etth2" \
+    "${COMMON_IO[@]}" \
+    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 32 \
+    --use_norm --valid_last \
+    --data ETTh2 --root_path "${DATA_ROOT}/ETT" --data_path ETTh2.csv --n_vars 7
+fi
+
+if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ettm1" ]]; then
+run_variants ettm1 "logs/table3/ettm1" "checkpoints/table3/ettm1" \
+    "${COMMON_IO[@]}" \
+    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 32 \
+    --use_norm --valid_last \
+    --data ETTm1 --root_path "${DATA_ROOT}/ETT" --data_path ETTm1.csv --n_vars 7
+fi
+
+if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "ettm2" ]]; then
+run_variants ettm2 "logs/table3/ettm2" "checkpoints/table3/ettm2" \
+    "${COMMON_IO[@]}" \
+    --e_layers 1 --d_model 1024 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 32 \
+    --use_norm --valid_last \
+    --data ETTm2 --root_path "${DATA_ROOT}/ETT" --data_path ETTm2.csv --n_vars 7
 fi
 
 if [[ "$ONLY_DS" == "all" || "$ONLY_DS" == "exchange" ]]; then
-echo "========== Exchange =========="
 run_variants exchange "logs/table3/exchange" "checkpoints/table3/exchange" \
-    "${COMMON[@]}" --data Exchange \
-    --root_path "${DATA_ROOT}/ExchangeRate" --data_path exchange_rate.csv \
-    --batch_size 32 --n_vars 8
+    "${COMMON_IO[@]}" \
+    --e_layers 4 --d_model 512 --n_heads 8 --d_ff 2048 \
+    --learning_rate 1e-4 --batch_size 32 \
+    --data Exchange --root_path "${DATA_ROOT}/ExchangeRate" --data_path exchange_rate.csv --n_vars 8
 fi
 
-echo ""
-echo "[$(date)] Table 3 ALL DONE. → result_long_term_forecast.txt"
+echo "[$(date)] done. results appended in result_long_term_forecast.txt"
