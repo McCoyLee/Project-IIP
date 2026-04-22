@@ -91,3 +91,19 @@ scripts/jobs/compare_table3_multi_dataset.sh
 - baseline/tan/fir_moe_tan 都在同一套对齐主干上比较
 
 这样你直接跑 `table3_96pred96.sh` 本身，就更接近论文对标口径。
+
+## 8) 为什么会 OOM（尤其 rank1/rank2 在 test/load ckpt 阶段）
+
+常见是某张卡（通常 GPU0）已经被其他进程占用，DDP 仍然把该卡纳入 `nproc_per_node`，导致某 rank 在加载 ckpt 时爆显存。
+
+现在脚本支持三种方式：
+
+1. 自动选空闲卡（默认 `AUTO_GPU=1`）
+2. 手动指定 `GPU_IDS`（例如 `GPU_IDS=1,2,3,4,5,6,7`）
+3. 显式 `CUDA_VISIBLE_DEVICES` + 对应 `NGPU/NPROC_PER_NODE`
+
+并默认启用：
+
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`
+
+用于缓解显存碎片。

@@ -14,6 +14,7 @@
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}
 export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 
 : "${DATA_ROOT:?请先 export DATA_ROOT=/你的/数据根目录}"
@@ -30,10 +31,34 @@ elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
 fi
 conda activate timerxl
 
-NGPU="${NGPU:-8}"
+NGPU="${NGPU:-}"
 SEED_ENV="${SEED:-2021}"
 ONLY_DS="${ONLY_DATASET:-all}"
 ONLY_VAR="${ONLY_VARIANT:-all}"
+
+# 可选：自动挑选空闲显卡，避免 GPU0 被占用导致 OOM
+# AUTO_GPU=1 且未显式传 CUDA_VISIBLE_DEVICES/GPU_IDS 时生效。
+if [[ "${AUTO_GPU:-1}" == "1" && -z "${CUDA_VISIBLE_DEVICES:-}" && -z "${GPU_IDS:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    mapfile -t _free_ids < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F',' '{gsub(/ /,"",$2); if ($2+0 < 1024) print $1}')
+    if [[ ${#_free_ids[@]} -gt 0 ]]; then
+        export CUDA_VISIBLE_DEVICES="$(IFS=,; echo "${_free_ids[*]}")"
+    fi
+fi
+if [[ -n "${GPU_IDS:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+fi
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    _ngpu_vis=$(python - <<'PY2'
+import os
+v=os.environ.get('CUDA_VISIBLE_DEVICES','').strip()
+print(len([x for x in v.split(',') if x!='']) if v else 0)
+PY2
+)
+    if [[ "${NGPU:-}" == "" ]]; then
+        NGPU="${_ngpu_vis}"
+    fi
+fi
+NGPU="${NGPU:-8}" # fallback
 
 run_one () {
     local model_id="$1"; shift
