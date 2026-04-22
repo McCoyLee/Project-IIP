@@ -72,9 +72,12 @@ SEED=2021 MODE=paper_literal NPROC_PER_NODE=8 ONLY_DATASET=etth1 \
 scripts/jobs/compare_table3_multi_dataset.sh
 ```
 
-它会对 `ecl/etth1/traffic/weather/solar` 依次执行：
+它会按 **原始 table3_96pred96.sh 的 9 个数据集** 依次执行：
 
-1. `MODE=paper_literal`（字面对照）
-2. `MODE=table3_matched`（推荐复现）
+1. `MODE=paper_literal`
+2. `MODE=table3_matched`
+3. 原始 `table3_96pred96.sh` 的 baseline（同 seed / GPU 设置）
 
-并在 CSV 中直接给出与 **Table 3 目标值** 的 gap（`|run - target|`），避免与旧 baseline 脚本（不同设定）混比。
+并输出统一 CSV：
+- 对有论文目标值的数据集（ecl/etth1/traffic/weather/solar）给出 `|run-target|` gap
+- 对其余数据集（etth2/ettm1/ettm2/exchange）保留 `target=NA`，只做方法间横向比较。
