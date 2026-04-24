@@ -54,7 +54,8 @@ class StableKoopmanSpectralResidual(nn.Module):
 
         win = max(2, min(int(self.trend_window), L))
         tail = history[..., -win:]
-        t = torch.linspace(-0.5, 0.5, win, device=history.device, dtype=history.dtype)
+        t = torch.arange(win, device=history.device, dtype=history.dtype)
+        t = t - t.mean()
         denom = t.square().sum().clamp_min(self.eps)
         tail_mean = tail.mean(dim=-1, keepdim=True)
         slope = ((tail - tail_mean) * t.view(1, 1, win)).sum(dim=-1, keepdim=True) / denom
